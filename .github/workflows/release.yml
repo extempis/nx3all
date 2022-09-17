@@ -1,0 +1,60 @@
+---
+name: Release
+on:
+  push:
+    tags:
+      - '*'
+    branches:
+      - develop
+
+jobs:
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: "checkout"
+        uses: actions/checkout@v3
+
+      - name: Compute Version
+        run: |
+          set -x
+          git fetch --prune --unshallow
+
+          TAG_EXACT=$(git describe --exact-match --abbrev=0 --tags || true)
+          TAG_NEAR=$(git describe --abbrev=0 --tags)
+          COMMIT_TAG=$(git rev-parse --short HEAD)
+          BRANCH=$(git branch  --show-current)
+
+          if [ -z $TAG_EXACT ]; then 
+            echo "tag_name=$BRANCH" >> $GITHUB_ENV
+            echo "VERSION=$TAG_NEAR" >> $GITHUB_ENV
+            echo "COMMIT_TAG=${COMMIT_TAG}" >> $GITHUB_ENV
+          else
+            echo "tag_name=$TAG_EXACT" >> $GITHUB_ENV
+            echo "VERSION=$TAG_EXACT" >> $GITHUB_ENV
+            echo "COMMIT_TAG=" >> $GITHUB_ENV
+          fi
+          
+      - name: Generate Release
+        run: |
+          ./scripts/generate.sh
+
+      - uses: dev-drprasad/delete-tag-and-release@v0.2.0
+        if: env.branch != 'main'
+        with:
+          delete_release: true # default: false
+          tag_name: ${{ env.tag_name }} # tag name to delete
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Push Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ env.tag_name }}
+          files: |
+            artifacts/nx3all-${{ env.VERSION }}-1${{ env.COMMIT_TAG }}.tar.gz
+            artifacts/nx3all-${{ env.VERSION }}-1${{ env.COMMIT_TAG }}.tar.gz.sha256.txt
+            artifacts/nx3all-${{ env.VERSION }}-1${{ env.COMMIT_TAG }}.noarch.rpm
+            artifacts/nx3all-${{ env.VERSION }}-1${{ env.COMMIT_TAG }}.noarch.rpm.sha256.txt
+            artifacts/nx3all-${{ env.VERSION }}-1${{ env.COMMIT_TAG }}.deb
+            artifacts/nx3all-${{ env.VERSION }}-1${{ env.COMMIT_TAG }}.deb.sha256.txt
