@@ -351,17 +351,17 @@ download() {
 
   for file in $LIST
   do
-    #jq -c ".items[].assets[] | objects " $file | while read obj; do
-    objs=$(jq -c ".items[].assets[] | objects " $file)
-    for obj in $objs 
+    objs=$(jq -c ".items[].assets[]" $file | jq -s .)
+    length=$(jq ".|length" <<<$objs)
+    length=$(( length -1 ))
+    for i in `seq 0 $length`
     do
-      arr=( $(echo $obj | jq -r ". | .downloadUrl, .path, .contentType, .checksum.sha1, .checksum.sha256" ) )
-      downloadUrl=${arr[0]}
-      name=$(basename $downloadUrl)
-      path=${arr[1]}
-      contentType=${arr[2]}
-      sha1=${arr[3]}
-      sha256=${arr[4]}
+      downloadUrl=$(jq -r ".[$i].downloadUrl" <<<$objs)
+      name=$( basename $downloadUrl | tr -d '"' )
+      path=$(jq -r ".[$i].path" <<<$objs)
+      contentType=$(jq  ".[$i].contentType" <<<$objs)
+      sha1=$(jq -r ".[$i].checksum.sha1" <<<$objs)
+      sha256=$(jq -r ".[$i].checksum.sha256" <<<$objs)
 
       # we postpone html file
       if [ "$contentType" != "text/html" ]
