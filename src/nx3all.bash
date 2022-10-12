@@ -319,7 +319,7 @@ wget_item () {
   if [ -f "$(dirname $path)/$name" ]; then
     integrity 
   else
-    LOG=$($CURL -o $(dirname $path)/$name $downloadUrl 2>&1)
+    LOG=$($CURL -o $(dirname "$path")/"$name" "$downloadUrl" 2>&1)
     RS=$?
     [ $RS -ne 0 ] && echo "Error: wget failed for $name in repository $repository : $downloadUrl ($LOG)" >> $LOGERROR && NB_FILE_KO=$((NB_FILE_KO + 1)) && return
     integrity 
@@ -357,7 +357,7 @@ download() {
     for i in `seq 0 $length`
     do
       downloadUrl=$(jq -r ".[$i].downloadUrl" <<<$objs)
-      name=$( basename $downloadUrl | tr -d '"' )
+      name=$( basename "$downloadUrl" | tr -d '"' )
       path=$(jq -r ".[$i].path" <<<$objs)
       contentType=$(jq  ".[$i].contentType" <<<$objs)
       sha1=$(jq -r ".[$i].checksum.sha1" <<<$objs)
