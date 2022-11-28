@@ -28,8 +28,9 @@ TARDIR="${DESTDIR}/nx3all-${VERSION}"
 mkdir -p ${TARDIR}
 
 # generate binary
-cat ${SCRIPTDIR}/script.sh > ${TARDIR}/nx3all
-base64 ${SCRIPTDIR}/../src/nx3all.bash >> ${TARDIR}/nx3all
+#cat ${SCRIPTDIR}/script.sh > ${TARDIR}/nx3all
+#base64 ${SCRIPTDIR}/../src/nx3all.bash >> ${TARDIR}/nx3all
+cp ${SCRIPTDIR}/../src/nx3all.bash ${TARDIR}/nx3all
 chmod +x ${TARDIR}/nx3all
 
 # generate footprint
