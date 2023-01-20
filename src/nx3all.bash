@@ -25,10 +25,13 @@ CMD=
 DIR_PREFIX="$PWD/dl"
 DESTINATION=
 SOURCE=
-BACKUP_LIST=
+ARGS_LIST=
 BASE_URL=
 ARCHIVE=
 CHECK_INTEGRITY=
+OPTION_LIST=false
+OPTION_CREATE=false
+OPTION_REMOVE_ALL=false
 
 _spin="/-\|"
 _spini=0
@@ -100,6 +103,22 @@ usage () {
     $ $(basename $0) restore -u nexus_url -s source_dir -d nexus-repo-name
         $ $(basename $0) restore -u https://nexus.domain/nexus -s ./dl/maven -d maven-central
 
+    # Create default usefull tasks
+    $ $(basename $0) task -u nexus_url -c
+        $ $(basename $0) task -u https://nexus.domain/nexus -c
+
+    # List all tasks
+    $ $(basename $0) task -u nexus_url -l
+        $ $(basename $0) task -u https://nexus.domain/nexus -l
+
+    # Invalidate all repositories cache
+    $ $(basename $0) invalidatecache -u nexus_url -a
+        $ $(basename $0) task -u https://nexus.domain/nexus -l
+
+    # Invalidate cache for some repositories
+    $ $(basename $0) invalidatecache -u nexus_url -s maven,raw-files,npm-proxy
+        $ $(basename $0) task -u https://nexus.domain/nexus -l
+
     Note:
       Behind a proxy, you must set environment variables :
       on linux:   http_proxy/https_proxy 
@@ -130,8 +149,14 @@ parse_args() {
     "restorecfg")
       CMD="RESTORE_CFG"
       ;;
-    "deleteall")
-      CMD="DELETE_ALL"
+    "delete")
+      CMD="DELETE"
+      ;;
+    "invalidatecache")
+      CMD="CACHE"
+      ;;
+    "task")
+      CMD="TASK"
       ;;
     "version")
       echo "Version : $VERSION"
@@ -144,7 +169,7 @@ parse_args() {
   esac
   shift
   
-  VALID_ARGS=$(getopt -o iau:s:d:p:hz --long integrity:,all,zip,url:,source:,destination:,prefix:,help -- "$@")
+  VALID_ARGS=$(getopt -o crliau:s:d:p:hz --long remove,list,create,integrity:,all,zip,url:,source:,destination:,prefix:,help -- "$@")
   if [[ $? -ne 0 ]]; then
       exit 1;
   fi
@@ -158,7 +183,7 @@ parse_args() {
           shift 2
           ;;
       -a | --all)
-          BACKUP_LIST="--all"
+          ARGS_LIST="--all"
           shift
           ;;
       -i | --integrity)
@@ -167,7 +192,7 @@ parse_args() {
           ;;
       -s | --source)
           SOURCE="$2"
-          BACKUP_LIST="$2"
+          ARGS_LIST="$2"
           shift 2
           ;;
       -d | --destination)
@@ -185,6 +210,18 @@ parse_args() {
           ;;
       -z | --zip)
           ARCHIVE=true
+          shift
+          ;;
+      -l | --list)
+          OPTION_LIST=true
+          shift
+          ;;
+      -c | --create)
+          OPTION_CREATE=true
+          shift
+          ;;
+      -r | --remove)
+          OPTION_REMOVE_ALL=true
           shift
           ;;
       --) shift; 
@@ -385,14 +422,14 @@ download() {
 
 backup() {
   # Verify inputs
-  [ -z "$BACKUP_LIST" ] && usage && echo "${_RED}Error:${_RESET} Missing repositories list to backup" && exit 1
+  [ -z "$ARGS_LIST" ] && usage && echo "${_RED}Error:${_RESET} Missing repositories list to backup" && exit 1
 
   mkdir -p $DIR_PREFIX/.metadata
   
   LIST=$(list)
   FORMAT=$(echo "$LIST" | grep "$DESTINATION" | awk '{print $3}' )
   
-  for item in ${BACKUP_LIST//,/ }
+  for item in ${ARGS_LIST//,/ }
   do
     case "$item" in
       --all)
@@ -581,7 +618,7 @@ restore_config(){
   done
 }
 
-delete_all(){
+destroy_all(){
   read -p "Are you sure to delete all repositories ? " -n 1 -r
   echo    # (optional) move to a new line
   if [[ $REPLY =~ ^[Yy]$ ]]
@@ -604,6 +641,160 @@ delete_all(){
       printf "%-10s %-40s $_GREEN[deleted]$_RESET\n"  Blob $name
     done
     rm -f .output.json
+  fi
+}
+
+delete_content() {
+  [ -z "$ARGS_LIST" ] && usage && echo "${_RED}Error:${_RESET} Missing repositories list to delete contents" && exit 1
+  
+  mkdir -p $DIR_PREFIX/.metadata
+  for repository in ${ARGS_LIST//,/ }
+  do
+    LIST=$(list)
+    TYPE=$(echo "$LIST" | grep "^$repository" | awk '{print $2}' )
+    [[ "$TYPE" != "hosted" && "$TYPE" != "proxy" ]] && echo "${_RED}Error:${_RESET} Impossible to delete contents from the repository ${_BLUE}$repository${_RESET} ${_BLUE}$DESTINATION${_RESET} because it is not a ${_GREEN}'hosted or proxy'${_RESET} type but a ${_RED}'$TYPE'${_RESET} type" && continue
+
+    read -p "Are you sure you want to delete the content of the repository : $repository ? " -n 1 -r
+    if [[ $REPLY =~ ^[Yy]$ ]]
+    then
+      nb_file=0
+      TOTAL_ITEMS=0
+      getAllpage $repository 0 1
+
+      LIST=$(find $METADIR -maxdepth 1 -name "$repository*.json")
+      [ -z "$LIST" ] && printf "\r%-40s %s$ERASETOEOL\n" "Remove content for $repository" "[${_YELLOW}SKIP${_RESET}](${_BLUE}$TOTAL_ITEMS${_RESET})" && continue
+
+      TOTAL_ITEMS=$(cat $METADIR/$repository*.json | grep downloadUrl | wc -l)
+      [ $TOTAL_ITEMS -eq 0 ] && printf "\r%-40s %s$ERASETOEOL\n" "Remove content for $repository" "[${_YELLOW}SKIP${_RESET}](${_BLUE}$TOTAL_ITEMS${_RESET})" && continue
+
+      for file in $LIST
+      do
+        objs=$(jq -c ".items[]" $file | jq -s .)
+        length=$(jq ".|length" <<<$objs)
+        length=$(( length -1 ))
+        for i in `seq 0 $length`
+        do
+          id=$(jq -r ".[$i].id" <<<$objs)
+          name=$(jq -r ".[$i].name" <<<$objs)
+          $CURL -X 'DELETE' $BASE_URL"/service/rest/v1/components/$id"   -H 'accept: application/json' > /dev/null
+          nb_file=$(( nb_file + 1 ))
+          progressbar "Remove contents for  $repository $name" "$nb_file" "$TOTAL_ITEMS"
+        done
+      done
+
+      _string="Remove content for $repository"
+      (( ${#_string} > 40 )) && _string="${_string:0:37}..."
+      printf "\r%-40s %s$ERASETOEOL\n" "$_string" "[${_GREEN}COMPLETE${_RESET}]"
+    fi
+  done
+}
+
+invalidateCache() {
+  LIST=$(list)
+  if [[ "$ARGS_LIST" == '--all' ]]
+  then
+    REPOS=$(echo "$LIST" | grep -v "hosted" | awk '{print $1}' )
+    for repository in ${REPOS}
+    do
+      HTTP_CODE=$($CURL -w "%{http_code}" -X 'POST' \
+              ${BASE_URL}"/service/rest/v1/repositories/$repository/invalidate-cache" \
+              -H 'accept: application/json')
+      [[ ${HTTP_CODE} -ne 204 ]] && echo -e "Invalidate cache for $repository failed with code $HTTP_CODE"
+      [[ ${HTTP_CODE} -eq 204 ]] && echo -e "Invalidate cache for $repository ${_GREEN}Succeeded!${_RESET}"
+    done
+  else
+    for repository in ${ARGS_LIST//,/ }
+    do
+      TYPE=$(echo "$LIST" | grep "^$repository" | awk '{print $2}' )
+      [[ "$TYPE" = "hosted" ]] && echo "${_RED}Error:${_RESET} Impossible to invalidate cache for the repository ${_BLUE}$repository${_RESET} ${_BLUE}$DESTINATION${_RESET} because it is not a ${_GREEN}'group or proxy'${_RESET} type but a ${_RED}'$TYPE'${_RESET} type" && continue
+      # Proxy or group repositories only.
+      HTTP_CODE=$($CURL -w "%{http_code}" -X 'POST' \
+              ${BASE_URL}"/service/rest/v1/repositories/$repository/invalidate-cache" \
+              -H 'accept: application/json')
+      [[ ${HTTP_CODE} -ne 204 ]] && echo -e "Invalidate cache for $repository failed with code $HTTP_CODE"
+      [[ ${HTTP_CODE} -eq 204 ]] && echo -e "Invalidate cache for $repository ${_GREEN}Succeeded!${_RESET}"
+    done
+  fi
+}
+
+delete() {
+  if [[ $ARGS_LIST == '--all' ]]
+  then
+    destroy_all
+  else
+    delete_content
+  fi
+}
+
+task() {
+  LIST=$(list)
+  YUM_REPOS_NAME=$(echo "$LIST" | grep yum | awk '{print $1}')
+  BLOB=$($CURL -X 'GET' \
+    ${BASE_URL}'/service/rest/v1/blobstores' \
+    -H 'accept: application/json')
+
+  bck='{"action":"coreui_Task","method":"create","data":[{"id":"","typeId":"db.backup","enabled":true,"name":"admin-backup-database","alertEmail":"","notificationCondition":"FAILURE","schedule":"daily","properties":{"location":"/nexus-data/backup"},"recurringDays":[],"startDate":"2023-01-01T22:00:00.000Z","timeZoneOffset":"+01:00"}],"type":"rpc","tid":134}'
+  docker='{"action":"coreui_Task","method":"create","data":[{"id":"","typeId":"repository.docker.upload-purge","enabled":true,"name":"docker-delete-incomplete-uploads","alertEmail":"","notificationCondition":"FAILURE","schedule":"weekly","properties":{"age":"72"},"recurringDays":[7],"startDate":"2023-01-18T08:15:00.000Z","timeZoneOffset":"+01:00"}],"type":"rpc","tid":137}'
+  npm='{"action":"coreui_Task","method":"create","data":[{"id":"","typeId":"repository.npm.rebuild-metadata","enabled":true,"name":"repair-all-npm-metadata","alertEmail":"","notificationCondition":"FAILURE","schedule":"daily","properties":{"repositoryName":"*","packageName":""},"recurringDays":[],"startDate":"2023-01-18T20:00:00.000Z","timeZoneOffset":"+01:00"}],"type":"rpc","tid":195}'
+  browse='{"action":"coreui_Task","method":"create","data":[{"id":"","typeId":"create.browse.nodes","enabled":true,"name":"repair-rebuild-all-repo-browse","alertEmail":"","notificationCondition":"FAILURE","schedule":"daily","properties":{"repositoryName":"*"},"recurringDays":[],"startDate":"2023-01-18T20:00:00.000Z","timeZoneOffset":"+01:00"}],"type":"rpc","tid":146}'
+  search='{"action":"coreui_Task","method":"create","data":[{"id":"","typeId":"repository.rebuild-index","enabled":true,"name":"repair-rebuild-all-repo-search","alertEmail":"","notificationCondition":"FAILURE","schedule":"daily","properties":{"repositoryName":"*"},"recurringDays":[],"startDate":"2023-01-18T20:00:00.000Z","timeZoneOffset":"+01:00"}],"type":"rpc","tid":152}'
+
+  yum='{"action":"coreui_Task","method":"create","data":[{"id":"","typeId":"repository.yum.rebuild.metadata","enabled":true,"name":"repair-rebuild-yum-metadata","alertEmail":"","notificationCondition":"FAILURE","schedule":"daily","properties":{"repositoryName":"dr-yum-hosted","yumMetadataCaching":"false"},"recurringDays":[],"startDate":"2023-01-18T20:00:00.000Z","timeZoneOffset":"+01:00"}],"type":"rpc","tid":158}'
+  cpt='{"action":"coreui_Task","method":"create","data":[{"id":"","typeId":"blobstore.compact","enabled":true,"name":"compact-blob-raw-hosted2","alertEmail":"","notificationCondition":"FAILURE","schedule":"weekly","properties":{"blobstoreName":"raw-hosted"},"recurringDays":[7],"startDate":"2023-01-01T21:00:00.000Z","timeZoneOffset":"+01:00"}],"type":"rpc","tid":113}'
+
+  if [[ $OPTION_CREATE == 'true' ]]
+  then
+    for i in "bck" "docker" "npm" "browse" "search"
+    do
+      $CURL -X 'POST'  ${BASE_URL}'/service/extdirect' \
+          -H 'Content-Type: application/json' \
+          --data-raw "${!i}" > /dev/null
+    done
+    echo $BLOB | jq -c '.[]' | while read i; do
+      blob_mane=$(echo $i | jq -r .name)
+      resu=$(echo $cpt | jq -c ".data[].name = \"compact-blob-$blob_mane\" | .data[].properties.blobstoreName = \"$blob_mane\"")
+      $CURL -X 'POST'  ${BASE_URL}'/service/extdirect' \
+          -H 'Content-Type: application/json' \
+          --data-raw "$resu" > /dev/null
+    done
+    for i in $YUM_REPOS_NAME
+    do
+      resu=$(echo $yum | jq -c ".data[].name = \"repair-rebuild-yum-metadata-$i\" | .data[].properties.repositoryName = \"$i\"")
+      $CURL -X 'POST'  ${BASE_URL}'/service/extdirect' \
+          -H 'Content-Type: application/json' \
+          --data-raw "$resu" > /dev/null
+    done
+  fi
+  if [[ $OPTION_LIST == 'true' ]]
+  then
+    while :
+    do
+      resu=$($CURL -X 'GET' \
+            ${BASE_URL}'/service/rest/v1/tasks' \
+            -H 'accept: application/json')
+      continuationToken=$(echo $resu | jq -r .continuationToken)
+      echo $resu | jq -c '.items[]' | while read i; do
+        echo $i | jq -r '. | "\(.id)\t\t\(.name)\t\t\(.type) "'
+      done
+      [ "$continuationToken" == "null" ] && break
+    done
+  fi
+  if [[ $OPTION_REMOVE_ALL == 'true' ]]
+  then
+    while :
+    do
+      resu=$($CURL -X 'GET' \
+            ${BASE_URL}'/service/rest/v1/tasks' \
+            -H 'accept: application/json')
+      continuationToken=$(echo $resu | jq -r .continuationToken)
+      echo $resu | jq -c '.items[]' | while read i; do
+        id=$(echo $i | jq -r '.id')
+        $CURL -X 'POST'  ${BASE_URL}'/service/extdirect' \
+            -H 'Content-Type: application/json' \
+            --data-raw "{\"action\":\"coreui_Task\",\"method\":\"remove\",\"data\":[\"$id\"],\"type\":\"rpc\",\"tid\":402}" > /dev/null
+      done
+      [ "$continuationToken" == "null" ] && break
+    done
   fi
 }
 
@@ -630,9 +821,17 @@ case "$CMD" in
     ping
     restore_config
     ;;
-  "DELETE_ALL")
+  "DELETE")
     ping
-    delete_all
+    delete
+    ;;
+  "CACHE")
+    ping
+    invalidateCache
+    ;;
+  "TASK")
+    ping
+    task
     ;;
   *) 
     exit 1
