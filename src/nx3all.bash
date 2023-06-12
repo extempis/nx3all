@@ -427,7 +427,7 @@ backup() {
   mkdir -p $DIR_PREFIX/.metadata
   
   LIST=$(list)
-  FORMAT=$(echo "$LIST" | grep "$DESTINATION" | awk '{print $3}' )
+  FORMAT=$(echo "$LIST" | grep "^$DESTINATION\ " | awk '{print $3}' )
   
   for item in ${ARGS_LIST//,/ }
   do
@@ -495,8 +495,16 @@ compress () {
 
 restore_raw() {
   cd $SOURCE
-  find . -type f | sed "s|^\./||" | xargs -I '{}' $CURL -X PUT -T {} ${BASE_URL}/repository/$DESTINATION/{} ;
+  OIFS="$IFS"
+  IFS=$'\n'
+  FIND=$(find . -type f | sed "s|^\./||")
+  for file in $FIND
+  do
+     file_url=$(echo $file | sed 's/ /%20/g')
+     curl -nks -X PUT --upload-file "$file" "${BASE_URL}/repository/$DESTINATION/$file_url"
+  done
   cd -
+  IFS="$OIFS"
 }
 
 restore_api() {
@@ -531,8 +539,8 @@ restore() {
   SOURCE="$(realpath $SOURCE)"
 
   LIST=$(list)
-  TYPE=$(echo "$LIST" | grep "^$DESTINATION" | awk '{print $2}' )
-  FORMAT=$(echo "$LIST" | grep "^$DESTINATION" | awk '{print $3}' )
+  TYPE=$(echo "$LIST" | grep "^$DESTINATION\ " | awk '{print $2}' )
+  FORMAT=$(echo "$LIST" | grep "^$DESTINATION\ " | awk '{print $3}' )
 
   [ "$TYPE" != "hosted" ] && echo "${_RED}Error:${_RESET} Impossible to upload to the repository ${_BLUE}$DESTINATION${_RESET} because it is not a ${_GREEN}'hosted'${_RESET} type but a ${_RED}'$TYPE'${_RESET} type" && exit 1
   case "$FORMAT" in
@@ -651,7 +659,7 @@ delete_content() {
   for repository in ${ARGS_LIST//,/ }
   do
     LIST=$(list)
-    TYPE=$(echo "$LIST" | grep "^$repository" | awk '{print $2}' )
+    TYPE=$(echo "$LIST" | grep "^$repository\ " | awk '{print $2}' )
     [[ "$TYPE" != "hosted" && "$TYPE" != "proxy" ]] && echo "${_RED}Error:${_RESET} Impossible to delete contents from the repository ${_BLUE}$repository${_RESET} ${_BLUE}$DESTINATION${_RESET} because it is not a ${_GREEN}'hosted or proxy'${_RESET} type but a ${_RED}'$TYPE'${_RESET} type" && continue
 
     read -p "Are you sure you want to delete the content of the repository : $repository ? " -n 1 -r
@@ -705,7 +713,7 @@ invalidateCache() {
   else
     for repository in ${ARGS_LIST//,/ }
     do
-      TYPE=$(echo "$LIST" | grep "^$repository" | awk '{print $2}' )
+      TYPE=$(echo "$LIST" | grep "^$repository\" | awk '{print $2}' )
       [[ "$TYPE" = "hosted" ]] && echo "${_RED}Error:${_RESET} Impossible to invalidate cache for the repository ${_BLUE}$repository${_RESET} ${_BLUE}$DESTINATION${_RESET} because it is not a ${_GREEN}'group or proxy'${_RESET} type but a ${_RED}'$TYPE'${_RESET} type" && continue
       # Proxy or group repositories only.
       HTTP_CODE=$($CURL -w "%{http_code}" -X 'POST' \
