@@ -713,7 +713,7 @@ invalidateCache() {
   else
     for repository in ${ARGS_LIST//,/ }
     do
-      TYPE=$(echo "$LIST" | grep "^$repository\" | awk '{print $2}' )
+      TYPE=$(echo "$LIST" | grep "^$repository" | awk '{print $2}' )
       [[ "$TYPE" = "hosted" ]] && echo "${_RED}Error:${_RESET} Impossible to invalidate cache for the repository ${_BLUE}$repository${_RESET} ${_BLUE}$DESTINATION${_RESET} because it is not a ${_GREEN}'group or proxy'${_RESET} type but a ${_RED}'$TYPE'${_RESET} type" && continue
       # Proxy or group repositories only.
       HTTP_CODE=$($CURL -w "%{http_code}" -X 'POST' \
