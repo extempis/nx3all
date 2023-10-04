@@ -846,4 +846,5 @@ case "$CMD" in
     ;;
 esac
 LL=$(cat $LOGERROR)
-[ ! -z "$LL" ] && echo "${YELLOW}Warning${_RESET}: Can not download some files :" && cat "$LOGERROR"
+[ ! -z "$LL" ] && echo "${YELLOW}Warning${_RESET}: Can not download some files :" && cat "$LOGERROR" && exit 1
+exit 0
