@@ -103,6 +103,10 @@ usage () {
     $ $(basename $0) restore -u nexus_url -s source_dir -d nexus-repo-name
         $ $(basename $0) restore -u https://nexus.domain/nexus -s ./dl/maven -d maven-central
 
+    # Get metadata only 
+    $ $(basename $0) metadata -u nexus_url -s nexus-repo-name
+        $ $(basename $0) metadata -u https://nexus.domain/nexus -s maven-central
+
     # Create default usefull tasks
     $ $(basename $0) task -u nexus_url -c
         $ $(basename $0) task -u https://nexus.domain/nexus -c
@@ -158,6 +162,9 @@ parse_args() {
     "task")
       CMD="TASK"
       ;;
+    "metadata")
+      CMD="METADATA"
+      ;;
     "version")
       echo "Version : $VERSION"
       exit 0
@@ -169,7 +176,7 @@ parse_args() {
   esac
   shift
   
-  VALID_ARGS=$(getopt -o crliau:s:d:p:hz --long remove,list,create,integrity:,all,zip,url:,source:,destination:,prefix:,help -- "$@")
+  VALID_ARGS=$(getopt -o crliau:s:d:p:hz --long metadata:,remove,list,create,integrity:,all,zip,url:,source:,destination:,prefix:,help -- "$@")
   if [[ $? -ne 0 ]]; then
       exit 1;
   fi
@@ -322,6 +329,7 @@ getAllpage() {
     HTTP_STATUS=$($CURL -o "$METADIR/$repository$pad.json" -w "%{http_code}" -X 'GET' $BASE_URL'/service/rest/v1/components?repository='$repository'&continuationToken='$continuationToken -H 'accept: application/json')
     [ "$HTTP_STATUS" != "200"  ] && echo "Receive HTTP_STATUS=$HTTP_STATUS" && rm -f "$METADIR/$repository$pad.json"
   done
+  #jq -n '{ items : [ inputs.items ] | add}' `ls $METADIR/$repository*.json` > $METADIR/$repository.json
   printf "\r%-40s %s$ERASETOEOL\n" "$_string" "[${_GREEN}COMPLETE${_RESET}]" && return
 }
 
@@ -840,6 +848,10 @@ case "$CMD" in
   "TASK")
     ping
     task
+    ;;
+  "METADATA")
+    ping
+    getAllpage $ARGS_LIST 0 1
     ;;
   *) 
     exit 1
