@@ -742,40 +742,96 @@ delete() {
   fi
 }
 
+# see https://help.sonatype.com/en/tasks.html
 task() {
   LIST=$(list)
   YUM_REPOS_NAME=$(echo "$LIST" | grep yum | awk '{print $1}')
+  MAVEN_REPOS_NAME=$(echo "$LIST" | grep maven2 | awk '{print $1}')
   BLOB=$($CURL -X 'GET' \
     ${BASE_URL}'/service/rest/v1/blobstores' \
     -H 'accept: application/json')
 
-  bck='{"action":"coreui_Task","method":"create","data":[{"id":"","typeId":"db.backup","enabled":true,"name":"admin-backup-database","alertEmail":"","notificationCondition":"FAILURE","schedule":"daily","properties":{"location":"/nexus-data/backup"},"recurringDays":[],"startDate":"2023-01-01T22:00:00.000Z","timeZoneOffset":"+01:00"}],"type":"rpc","tid":134}'
+  # Create Admin - Compact blob store
+  blob_compact='{"action":"coreui_Task","method":"create","data":[{"id":"","typeId":"blobstore.compact","enabled":true,"name":"compact-blob-raw-hosted2","alertEmail":"","notificationCondition":"FAILURE","schedule":"weekly","properties":{"blobstoreName":"raw-hosted"},"recurringDays":[7],"startDate":"2023-01-01T21:00:00.000Z","timeZoneOffset":"+01:00"}],"type":"rpc","tid":113}'
+  # Create Admin - Delete blob store temporary files
+  blob_delete_tmp='{"action":"coreui_Task","method":"create","data":[{"id":"","typeId":"blobstore.delete-temp-files","enabled":true,"name":"deleteme","alertEmail":"","notificationCondition":"FAILURE","schedule":"daily","properties":{"blobstoreName":"bob-containers"},"recurringDays":[],"startDate":"2024-02-14T03:00:00.000Z","timeZoneOffset":"+01:00"}],"type":"rpc","tid":21}'
+  # Create Admin - Export databases for backup
+  # For those using OrientDB, this task performs a full backup of the underlying config, security, and component databases - not blobstore content.
+  # Be aware that while the task is running, the repository will temporarily be put into a read-only state.
+  admin_backup_db='{"action":"coreui_Task","method":"create","data":[{"id":"","typeId":"db.backup","enabled":true,"name":"admin-export-database-for-backup","alertEmail":"","notificationCondition":"FAILURE","schedule":"daily","properties":{"location":"/nexus-data/backup"},"recurringDays":[],"startDate":"2023-01-01T22:00:00.000Z","timeZoneOffset":"+01:00"}],"type":"rpc","tid":134}'
+  # Create Docker - Delete incomplete uploads
+  # This task cleans up orphaned files that may exist in temporary storage as result of a restart or incomplete/interrupted uploads.
   docker='{"action":"coreui_Task","method":"create","data":[{"id":"","typeId":"repository.docker.upload-purge","enabled":true,"name":"docker-delete-incomplete-uploads","alertEmail":"","notificationCondition":"FAILURE","schedule":"weekly","properties":{"age":"72"},"recurringDays":[7],"startDate":"2023-01-18T08:15:00.000Z","timeZoneOffset":"+01:00"}],"type":"rpc","tid":137}'
+  # Create PyPI - Delete legacy proxy assets
+  # This task deletes old assets that were previously duplicated due to a code-path change.
+  pypi_delete_legacy_proxy_assets='{"action":"coreui_Task","method":"create","data":[{"id":"","typeId":"repository.pypi.delete-legacy-proxy-assets","enabled":true,"name":"pypi-delete-legacy-proxy-assets","alertEmail":"","notificationCondition":"FAILURE","schedule":"weekly","properties":{},"recurringDays":[1],"startDate":"2024-02-14T09:00:00.000Z","timeZoneOffset":"+01:00"}],"type":"rpc","tid":174}'
+  # Create Repair - Rebuild Maven repository metadata (maven-metadata.xml) Task
+  # This task rebuilds the maven-metadata.xml files with the correct information and will also (optionally) validate and fix any incorrect checksums (.md5/.sha1) for all files in the specified maven2 hosted repository.
+  maven='{"action":"coreui_Task","method":"create","data":[{"id":"","typeId":"repository.maven.rebuild-metadata","enabled":true,"name":"repair-rebuild-metadata-maven","alertEmail":"","notificationCondition":"FAILURE","schedule":"daily","properties":{"repositoryName":"dr-maven-releases","groupId":"","artifactId":"","baseVersion":"","rebuildChecksums":"true"},"recurringDays":[],"startDate":"2024-02-13T20:00:00.000Z","timeZoneOffset":"+01:00"}],"type":"rpc","tid":12}'
+  # Create Repair - Rebuild npm metadata Task
+  # This task rebuilds the metadata for a chosen npm hosted repository and can serve as a recovery tool in cases where the npm metadata has been corrupted. The task can rebuild metadata for all packages in the repository or only for a specified package.
   npm='{"action":"coreui_Task","method":"create","data":[{"id":"","typeId":"repository.npm.rebuild-metadata","enabled":true,"name":"repair-all-npm-metadata","alertEmail":"","notificationCondition":"FAILURE","schedule":"daily","properties":{"repositoryName":"*","packageName":""},"recurringDays":[],"startDate":"2023-01-18T20:00:00.000Z","timeZoneOffset":"+01:00"}],"type":"rpc","tid":195}'
+  # Create Repair - Rebuild repository browse Task
+  # This task rebuilds the tree browsing data based upon current information in the database.
   browse='{"action":"coreui_Task","method":"create","data":[{"id":"","typeId":"create.browse.nodes","enabled":true,"name":"repair-rebuild-all-repo-browse","alertEmail":"","notificationCondition":"FAILURE","schedule":"daily","properties":{"repositoryName":"*"},"recurringDays":[],"startDate":"2023-01-18T20:00:00.000Z","timeZoneOffset":"+01:00"}],"type":"rpc","tid":146}'
+  # Create Repair - Rebuild repository search Task
+  # With support for hosted and proxy repositories, this task rebuilds the search index. It inspects actual components and assets found in the selected repository and thus reflects the true content for supporting search and browse actions.
   search='{"action":"coreui_Task","method":"create","data":[{"id":"","typeId":"repository.rebuild-index","enabled":true,"name":"repair-rebuild-all-repo-search","alertEmail":"","notificationCondition":"FAILURE","schedule":"daily","properties":{"repositoryName":"*"},"recurringDays":[],"startDate":"2023-01-18T20:00:00.000Z","timeZoneOffset":"+01:00"}],"type":"rpc","tid":152}'
-
+  # Create Repair - Rebuild Yum repository metadata (repodata) Task
+  # This task rebuilds the metadata for a chosen Yum hosted repository. 
+  # This task runs automatically 60 seconds (configurable) after an RPM is uploaded, deleted or redeployed.
   yum='{"action":"coreui_Task","method":"create","data":[{"id":"","typeId":"repository.yum.rebuild.metadata","enabled":true,"name":"repair-rebuild-yum-metadata","alertEmail":"","notificationCondition":"FAILURE","schedule":"daily","properties":{"repositoryName":"dr-yum-hosted","yumMetadataCaching":"false"},"recurringDays":[],"startDate":"2023-01-18T20:00:00.000Z","timeZoneOffset":"+01:00"}],"type":"rpc","tid":158}'
-  cpt='{"action":"coreui_Task","method":"create","data":[{"id":"","typeId":"blobstore.compact","enabled":true,"name":"compact-blob-raw-hosted2","alertEmail":"","notificationCondition":"FAILURE","schedule":"weekly","properties":{"blobstoreName":"raw-hosted"},"recurringDays":[7],"startDate":"2023-01-01T21:00:00.000Z","timeZoneOffset":"+01:00"}],"type":"rpc","tid":113}'
+  # Create Repair - Reconcile component database from blob store
+  # This task allows you to recover lost asset/component metadata from a chosen blob store. 
+  # The task is useful in cases where you have restored from backup, and the database and blob storage may be out of sync.
+  # This task should never be executed during normal operation of the server. When executed, the task searches the selected blob store for blobs missing their associated metadata. The asset/component metadata is restored based on the information contained in the blob store.
+  reconcile_db_blob='{"action":"coreui_Task","method":"create","data":[{"id":"","typeId":"blobstore.rebuildComponentDB","enabled":true,"name":"attention-repair-reconcile-component-database-from-blob-store-","alertEmail":"","notificationCondition":"FAILURE","schedule":"manual","properties":{"blobstoreName":"bob1","dryRun":"false","sinceDays":null,"restoreBlobs":"true","undeleteBlobs":"true","integrityCheck":"true"},"recurringDays":[],"startDate":null,"timeZoneOffset":"+01:00"}],"type":"rpc","tid":192}'
+  # Create Repair - Repair - Reconcile date metadata from blob store
+  reconcile_date='{"action":"coreui_Task","method":"create","data":[{"id":"","typeId":"rebuild.asset.uploadMetadata","enabled":true,"name":"attention-repair-reconcile-date-metadata-from-blob-store","alertEmail":"","notificationCondition":"FAILURE","schedule":"manual","properties":{},"recurringDays":[],"startDate":null,"timeZoneOffset":"+01:00"}],"type":"rpc","tid":196}'
+  # Create Statistics - recalculate vulnerabilities statistics Task
+  # This task provides the Log4j Visualizer with request log data. When run, it deletes the existing data that the visualizer is using and re-processes the logs.
+  Statistics_recalculate_vulnerabilities='{"action":"coreui_Task","method":"create","data":[{"id":"","typeId":"repository.vulnerability.statistics","enabled":true,"name":"Statistics-recalculate-vulnerabilities","alertEmail":"","notificationCondition":"FAILURE","schedule":"daily","properties":{},"recurringDays":[],"startDate":"2024-02-14T06:00:00.000Z","timeZoneOffset":"+01:00"}],"type":"rpc","tid":202}'
+  # Docker - Delete unused manifests and images
+  # This task will handle deletion of content that is no longer referenced, images that are no longer referenced by a tagged manifest and V1 layers that are no longer referenced by a tagged layer.
+  docker_delete_unused_manifests_images='{"action":"coreui_Task","method":"create","data":[{"id":"","typeId":"repository.docker.gc","enabled":true,"name":"docker-delete-unused-manifests-images","alertEmail":"","notificationCondition":"FAILURE","schedule":"daily","properties":{"repositoryName":"*","deployOffset":"24"},"recurringDays":[],"startDate":"2024-02-14T05:00:00.000Z","timeZoneOffset":"+01:00"}],"type":"rpc","tid":33}'
 
   if [[ $OPTION_CREATE == 'true' ]]
   then
-    for i in "bck" "docker" "npm" "browse" "search"
+    # global task 
+    for i in "admin_backup_db" "docker" "npm" "browse" "search" "pypi_delete_legacy_proxy_assets" "reconcile_date" "Statistics_recalculate_vulnerabilities" "docker_delete_unused_manifests_images"
     do
       $CURL -X 'POST'  ${BASE_URL}'/service/extdirect' \
           -H 'Content-Type: application/json' \
           --data-raw "${!i}" > /dev/null
     done
+    # blob stuff
     echo $BLOB | jq -c '.[]' | while read i; do
       blob_mane=$(echo $i | jq -r .name)
-      resu=$(echo $cpt | jq -c ".data[].name = \"compact-blob-$blob_mane\" | .data[].properties.blobstoreName = \"$blob_mane\"")
+      resu=$(echo $blob_compact | jq -c ".data[].name = \"compact-blob-$blob_mane\" | .data[].properties.blobstoreName = \"$blob_mane\"")
+      $CURL -X 'POST'  ${BASE_URL}'/service/extdirect' \
+          -H 'Content-Type: application/json' \
+          --data-raw "$resu" > /dev/null
+      resu=$(echo $blob_delete_tmp | jq -c ".data[].name = \"blob-delete-tmp-file-$blob_mane\" | .data[].properties.blobstoreName = \"$blob_mane\"")
+      $CURL -X 'POST'  ${BASE_URL}'/service/extdirect' \
+          -H 'Content-Type: application/json' \
+          --data-raw "$resu" > /dev/null
+      resu=$(echo $reconcile_db_blob | jq -c ".data[].name = \"attention-repair-reconcile-component-database-from-blob-store-$blob_mane\" | .data[].properties.blobstoreName = \"$blob_mane\"")
       $CURL -X 'POST'  ${BASE_URL}'/service/extdirect' \
           -H 'Content-Type: application/json' \
           --data-raw "$resu" > /dev/null
     done
+    # Yum repo tasks
     for i in $YUM_REPOS_NAME
     do
       resu=$(echo $yum | jq -c ".data[].name = \"repair-rebuild-yum-metadata-$i\" | .data[].properties.repositoryName = \"$i\"")
+      $CURL -X 'POST'  ${BASE_URL}'/service/extdirect' \
+          -H 'Content-Type: application/json' \
+          --data-raw "$resu" > /dev/null
+    done
+    # maven repo tasks
+    for i in $MAVEN_REPOS_NAME
+    do
+      resu=$(echo $maven | jq -c ".data[].name = \"repair-rebuild-metadata-$i\" | .data[].properties.repositoryName = \"$i\"")
       $CURL -X 'POST'  ${BASE_URL}'/service/extdirect' \
           -H 'Content-Type: application/json' \
           --data-raw "$resu" > /dev/null
