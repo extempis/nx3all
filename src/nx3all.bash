@@ -131,6 +131,9 @@ usage () {
 HELP_USAGE
 }
 
+# nx3all destroy -u https://nexus.domain/nexus
+# nx3all delete -u https://nexus.domain/nexus -s maven-
+
 parse_args() {
   # parsing verb
   case "$1" in
@@ -155,6 +158,9 @@ parse_args() {
       ;;
     "delete")
       CMD="DELETE"
+      ;;
+    "destroy")
+      CMD="DESTROY"
       ;;
     "invalidatecache")
       CMD="CACHE"
@@ -333,6 +339,22 @@ getAllpage() {
   printf "\r%-40s %s$ERASETOEOL\n" "$_string" "[${_GREEN}COMPLETE${_RESET}]" && return
 }
 
+
+check_if_repository_exists(){
+  repo=$1
+
+  LIST=$(list)
+  EXIST=$(echo "$LIST" | grep "^$repo\ " )
+
+  [ -z "$EXIST" ] && echo "${_RED}Error:${_RESET} The repository does not exists : $repo" && exit 1
+}
+
+check_if_folder_exists(){
+  folder=$1
+
+  [ ! -d "$folder" ] && echo "${_RED}Error:${_RESET} The folder does not exists : $folder" && exit 1
+}
+
 integrity() {
   if [ "$CHECK_INTEGRITY" == "y" ]
   then
@@ -374,7 +396,7 @@ wget_item () {
 
 download() {
   repository=$1
-  restore=$PWD
+  restore_path=$PWD
   CNT_REPO=$2
   NB_REPOS=$3
   TOTAL_ITEMS=0
@@ -425,7 +447,7 @@ download() {
   rm -f $POSTPONE_TMP
   [ $NB_FILE_OK == $TOTAL_ITEMS ] && printf "\r%-40s %s$ERASETOEOL\n" "dl $repository" "[${_GREEN}COMPLETE${_RESET}](${_BLUE}$TOTAL_ITEMS${_RESET})"
   [ $NB_FILE_OK != $TOTAL_ITEMS ] && printf "\r%-40s %s$ERASETOEOL\n" "dl $repository" "[${_YELLOW}INCOMPLETE${_RESET}](${_BLUE}$TOTAL_ITEMS${_RESET}-${_RED}$NB_FILE_KO${_RESET}=${_GREEN}$NB_FILE_OK${_RESET})"
-  cd $restore
+  cd $restore_path
 }
 
 backup() {
@@ -435,7 +457,6 @@ backup() {
   mkdir -p $DIR_PREFIX/.metadata
   
   LIST=$(list)
-  FORMAT=$(echo "$LIST" | grep "^$DESTINATION\ " | awk '{print $3}' )
   
   for item in ${ARGS_LIST//,/ }
   do
@@ -462,6 +483,7 @@ backup() {
       *)
         echo ""
         echo "Backup repository : $item"
+        check_if_repository_exists $item
         getAllpage $item 0 1
         download $item 0 1
         ;;
@@ -539,12 +561,15 @@ restore_api() {
   cd -
 }
 
-restore() {
+restore() {  
   # Verify inputs
   [ -z "$SOURCE" ] && usage && echo "${_RED}Error:${_RESET} Missing source folder!" && exit 1
   [ -z "$DESTINATION" ] && usage && echo "${_RED}Error:${_RESET} Missing the destination nexus repository!" && exit 1
 
+  check_if_folder_exists $SOURCE
   SOURCE="$(realpath $SOURCE)"
+
+  check_if_repository_exists $DESTINATION
 
   LIST=$(list)
   TYPE=$(echo "$LIST" | grep "^$DESTINATION\ " | awk '{print $2}' )
@@ -634,7 +659,7 @@ restore_config(){
   done
 }
 
-destroy_all(){
+destroy(){
   read -p "Are you sure to delete all repositories ? " -n 1 -r
   echo    # (optional) move to a new line
   if [[ $REPLY =~ ^[Yy]$ ]]
@@ -668,7 +693,7 @@ delete_content() {
   do
     LIST=$(list)
     TYPE=$(echo "$LIST" | grep "^$repository\ " | awk '{print $2}' )
-    [[ "$TYPE" != "hosted" && "$TYPE" != "proxy" ]] && echo "${_RED}Error:${_RESET} Impossible to delete contents from the repository ${_BLUE}$repository${_RESET} ${_BLUE}$DESTINATION${_RESET} because it is not a ${_GREEN}'hosted or proxy'${_RESET} type but a ${_RED}'$TYPE'${_RESET} type" && continue
+    [[ "$TYPE" != "hosted" && "$TYPE" != "proxy" ]] && echo "${_RED}Error:${_RESET} Impossible to delete contents from the repository ${_BLUE}$repository${_RESET} because it is not a ${_GREEN}'hosted or proxy'${_RESET} type but a ${_RED}'$TYPE'${_RESET} type" && continue
 
     read -p "Are you sure you want to delete the content of the repository : $repository ? " -n 1 -r
     if [[ $REPLY =~ ^[Yy]$ ]]
@@ -722,7 +747,7 @@ invalidateCache() {
     for repository in ${ARGS_LIST//,/ }
     do
       TYPE=$(echo "$LIST" | grep "^$repository" | awk '{print $2}' )
-      [[ "$TYPE" = "hosted" ]] && echo "${_RED}Error:${_RESET} Impossible to invalidate cache for the repository ${_BLUE}$repository${_RESET} ${_BLUE}$DESTINATION${_RESET} because it is not a ${_GREEN}'group or proxy'${_RESET} type but a ${_RED}'$TYPE'${_RESET} type" && continue
+      [[ "$TYPE" = "hosted" ]] && echo "${_RED}Error:${_RESET} Impossible to invalidate cache for the repository ${_BLUE}$repository${_RESET} because it is not a ${_GREEN}'group or proxy'${_RESET} type but a ${_RED}'$TYPE'${_RESET} type" && continue
       # Proxy or group repositories only.
       HTTP_CODE=$($CURL -w "%{http_code}" -X 'POST' \
               ${BASE_URL}"/service/rest/v1/repositories/$repository/invalidate-cache" \
@@ -733,14 +758,6 @@ invalidateCache() {
   fi
 }
 
-delete() {
-  if [[ $ARGS_LIST == '--all' ]]
-  then
-    destroy_all
-  else
-    delete_content
-  fi
-}
 
 # see https://help.sonatype.com/en/tasks.html
 task() {
@@ -895,7 +912,11 @@ case "$CMD" in
     ;;
   "DELETE")
     ping
-    delete
+    delete_content
+    ;;
+  "DESTROY")
+    ping
+    destroy
     ;;
   "CACHE")
     ping
