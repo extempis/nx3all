@@ -32,6 +32,7 @@ CHECK_INTEGRITY=
 OPTION_LIST=false
 OPTION_CREATE=false
 OPTION_REMOVE_ALL=false
+FILTER=
 
 _spin="/-\|"
 _spini=0
@@ -99,11 +100,14 @@ usage () {
     $ $(basename $0) backup -u nexus_url -s repo1,repo2,repo3
       $ $(basename $0) backup -u https://nexus.domain/nexus -s maven,raw-files,npm-proxy
 
+    # Backup only files that match a filter
+      $ $(basename $0) backup -u https://nexus.domain/nexus -s raw-files  --filter "/version/"
+
     # Restore artifacts
     $ $(basename $0) restore -u nexus_url -s source_dir -d nexus-repo-name
         $ $(basename $0) restore -u https://nexus.domain/nexus -s ./dl/maven -d maven-central
 
-    # Get metadata only 
+    # Get metadata only for one repository
     $ $(basename $0) metadata -u nexus_url -s nexus-repo-name
         $ $(basename $0) metadata -u https://nexus.domain/nexus -s maven-central
 
@@ -182,7 +186,7 @@ parse_args() {
   esac
   shift
   
-  VALID_ARGS=$(getopt -o crliau:s:d:p:hz --long metadata:,remove,list,create,integrity:,all,zip,url:,source:,destination:,prefix:,help -- "$@")
+  VALID_ARGS=$(getopt -o crliau:s:d:p:hzf: --long metadata:,remove,list,create,integrity:,all,zip,url:,source:,destination:,filter:,prefix:,help -- "$@")
   if [[ $? -ne 0 ]]; then
       exit 1;
   fi
@@ -236,6 +240,10 @@ parse_args() {
       -r | --remove)
           OPTION_REMOVE_ALL=true
           shift
+          ;;
+      -f | --filter)
+          FILTER="$2"
+          shift 2
           ;;
       --) shift; 
         break 
@@ -310,35 +318,43 @@ getAllpage() {
   repository=$1
   CNT_REPO=$2
   NB_REPOS=$3
-  iter=1
-  pad=`printf %010d $iter`
+
   _string="Get information for $repository"
   (( ${#_string} > 40 )) && _string="${_string:0:37}..."
 
-  METADIR=$DIR_PREFIX/.metadata/$repository
+  METADIR=$DIR_PREFIX/.metadata
+  TEMP_FILE="$METADIR/temp.json"
   rm -fr $METADIR
   mkdir -p $METADIR
 
-  resu=$($CURL -o "$METADIR/$repository$pad.json" -X 'GET' $BASE_URL'/service/rest/v1/components?repository='$repository -H 'accept: application/json')
-  NB_ITEMS=$(jq '.items|length' "$METADIR/$repository$pad.json")
-  [ "$NB_ITEMS" -eq "0" ] && printf "\r%-40s %s$ERASETOEOL\n" "$_string" "[${_YELLOW}SKIP${_RESET}]" && rm -f "$METADIR/$repository$pad.json" && return
+  resu=$($CURL -o "$TEMP_FILE" -X 'GET' $BASE_URL'/service/rest/v1/components?repository='$repository -H 'accept: application/json')
+  NB_ITEMS=$(jq '.items|length' "$TEMP_FILE")
+  [ "$NB_ITEMS" -eq "0" ] && printf "\r%-40s %s$ERASETOEOL\n" "$_string" "[${_YELLOW}SKIP${_RESET}]" && rm -f "$TEMP_FILE" && return
+
+  jq -n '{ items: [ inputs.items ] | add }' "$TEMP_FILE"  > $METADIR/.$repository.json
+  mv $METADIR/.$repository.json $METADIR/$repository.json
 
   while :
   do
     progressbar "Get information for $repository" $CNT_REPO $NB_REPOS
     
-    continuationToken=$(jq -r .continuationToken "$METADIR/$repository$pad.json")
+    continuationToken=$(jq -r .continuationToken "$TEMP_FILE")
     [ "$continuationToken" == "null" ] && break
 
     iter=$(( iter + 1 ))
     pad=`printf %010d $iter`
-    HTTP_STATUS=$($CURL -o "$METADIR/$repository$pad.json" -w "%{http_code}" -X 'GET' $BASE_URL'/service/rest/v1/components?repository='$repository'&continuationToken='$continuationToken -H 'accept: application/json')
-    [ "$HTTP_STATUS" != "200"  ] && echo "Receive HTTP_STATUS=$HTTP_STATUS" && rm -f "$METADIR/$repository$pad.json"
+    HTTP_STATUS=$($CURL -o "$TEMP_FILE" -w "%{http_code}" -X 'GET' $BASE_URL'/service/rest/v1/components?repository='$repository'&continuationToken='$continuationToken -H 'accept: application/json')
+
+    # Merge all json in one file
+    jq -n '{ items: [ inputs.items ] | add }' "$METADIR/$repository.json" "$TEMP_FILE"  > $METADIR/.$repository.json
+    mv $METADIR/.$repository.json $METADIR/$repository.json
+
+    [ "$HTTP_STATUS" != "200"  ] && echo "Receive HTTP_STATUS=$HTTP_STATUS" && rm -f "$TEMP_FILE"
   done
   #jq -n '{ items : [ inputs.items ] | add}' `ls $METADIR/$repository*.json` > $METADIR/$repository.json
+  rm -f "$TEMP_FILE"
   printf "\r%-40s %s$ERASETOEOL\n" "$_string" "[${_GREEN}COMPLETE${_RESET}]" && return
 }
-
 
 check_if_repository_exists(){
   repo=$1
@@ -403,42 +419,43 @@ download() {
   iter=1
   NB_FILE_OK=0
   NB_FILE_KO=0
-  METADIR=$DIR_PREFIX/.metadata/$repository
+  METADIR=$DIR_PREFIX/.metadata
+  repo_metaddata_file="$METADIR/$repository.json"
 
-  LIST=$(find $METADIR -maxdepth 1 -name "$repository*.json")
-  [ -z "$LIST" ] && printf "\r%-40s %s$ERASETOEOL\n" "dl $repository" "[${_YELLOW}SKIP${_RESET}](${_BLUE}$TOTAL_ITEMS${_RESET})" && return
-
-  TOTAL_ITEMS=$(cat $METADIR/$repository*.json | grep downloadUrl | wc -l)
-  [ $TOTAL_ITEMS -eq 0 ] && printf "\r%-40s %s$ERASETOEOL\n" "dl $repository" "[${_YELLOW}SKIP${_RESET}](${_BLUE}$TOTAL_ITEMS${_RESET})" && return
+  [ ! -f "$repo_metaddata_file" ] && printf "\r%-40s %s$ERASETOEOL\n" "dl $repository" "[${_YELLOW}SKIP${_RESET}](${_BLUE}$TOTAL_ITEMS${_RESET})" && return
 
   mkdir -p "$DIR_PREFIX/$repository"
   cd "$DIR_PREFIX/$repository"
 
   POSTPONE_TMP=`mktemp`
+  
+  if [ ! -z "$FILTER" ]
+  then
+    objs=$(jq ".items[].assets[] | select( .downloadUrl | strings | test(\"$FILTER\"))" $repo_metaddata_file | jq -s .)
+  else
+    objs=$(jq -c ".items[].assets[]" $repo_metaddata_file | jq -s .)
+  fi
+  TOTAL_ITEMS=$(jq ".|length" <<<$objs)
+  [ $TOTAL_ITEMS -eq 0 ] && printf "\r%-40s %s$ERASETOEOL\n" "dl $repository" "[${_YELLOW}SKIP${_RESET}](${_BLUE}$TOTAL_ITEMS${_RESET})" && return
 
-  for file in $LIST
+  length=$(( TOTAL_ITEMS -1 ))
+  for i in `seq 0 $length`
   do
-    objs=$(jq -c ".items[].assets[]" $file | jq -s .)
-    length=$(jq ".|length" <<<$objs)
-    length=$(( length -1 ))
-    for i in `seq 0 $length`
-    do
-      downloadUrl=$(jq -r ".[$i].downloadUrl" <<<$objs)
-      name=$( basename "$downloadUrl" | tr -d '"' )
-      path=$(jq -r ".[$i].path" <<<$objs)
-      contentType=$(jq  ".[$i].contentType" <<<$objs)
-      sha1=$(jq -r ".[$i].checksum.sha1" <<<$objs)
-      sha256=$(jq -r ".[$i].checksum.sha256" <<<$objs)
+    downloadUrl=$(jq -r ".[$i].downloadUrl" <<<$objs)
+    name=$( basename "$downloadUrl" | tr -d '"' )
+    path=$(jq -r ".[$i].path" <<<$objs)
+    contentType=$(jq  ".[$i].contentType" <<<$objs)
+    sha1=$(jq -r ".[$i].checksum.sha1" <<<$objs)
+    sha256=$(jq -r ".[$i].checksum.sha256" <<<$objs)
 
-      # we postpone html file
-      if [ "$contentType" != "text/html" ]
-      then
-        wget_item
-      else
-        echo "$name $downloadUrl $path $sha1 $sha256" >> $POSTPONE_TMP
-      fi
-      iter=$(( iter + 1 ))
-    done
+    # we postpone html file
+    if [ "$contentType" != "text/html" ]
+    then
+      wget_item
+    else
+      echo "$name $downloadUrl $path $sha1 $sha256" >> $POSTPONE_TMP
+    fi
+    iter=$(( iter + 1 ))
   done
   while read name downloadUrl path sha1 sha256
   do
@@ -691,36 +708,36 @@ delete_content() {
   mkdir -p $DIR_PREFIX/.metadata
   for repository in ${ARGS_LIST//,/ }
   do
+    check_if_repository_exists $repository
+
     LIST=$(list)
+
     TYPE=$(echo "$LIST" | grep "^$repository\ " | awk '{print $2}' )
     [[ "$TYPE" != "hosted" && "$TYPE" != "proxy" ]] && echo "${_RED}Error:${_RESET} Impossible to delete contents from the repository ${_BLUE}$repository${_RESET} because it is not a ${_GREEN}'hosted or proxy'${_RESET} type but a ${_RED}'$TYPE'${_RESET} type" && continue
 
     read -p "Are you sure you want to delete the content of the repository : $repository ? " -n 1 -r
     if [[ $REPLY =~ ^[Yy]$ ]]
     then
-      nb_file=0
       TOTAL_ITEMS=0
       getAllpage $repository 0 1
 
-      LIST=$(find $METADIR -maxdepth 1 -name "$repository*.json")
-      [ -z "$LIST" ] && printf "\r%-40s %s$ERASETOEOL\n" "Remove content for $repository" "[${_YELLOW}SKIP${_RESET}](${_BLUE}$TOTAL_ITEMS${_RESET})" && continue
+      METADIR=$DIR_PREFIX/.metadata
+      repo_metaddata_file="$METADIR/$repository.json"
+
+      [ ! -f "$repo_metaddata_file" ] && printf "\r%-40s %s$ERASETOEOL\n" "Remove content for $repository" "[${_YELLOW}SKIP${_RESET}](${_BLUE}$TOTAL_ITEMS${_RESET})" && continue
 
       TOTAL_ITEMS=$(cat $METADIR/$repository*.json | grep downloadUrl | wc -l)
       [ $TOTAL_ITEMS -eq 0 ] && printf "\r%-40s %s$ERASETOEOL\n" "Remove content for $repository" "[${_YELLOW}SKIP${_RESET}](${_BLUE}$TOTAL_ITEMS${_RESET})" && continue
 
-      for file in $LIST
+      objs=$(jq -c ".items[]" $repo_metaddata_file | jq -s .)
+      length=$(jq ".|length" <<<$objs)
+      length=$(( length -1 ))
+      for i in `seq 0 $length`
       do
-        objs=$(jq -c ".items[]" $file | jq -s .)
-        length=$(jq ".|length" <<<$objs)
-        length=$(( length -1 ))
-        for i in `seq 0 $length`
-        do
-          id=$(jq -r ".[$i].id" <<<$objs)
-          name=$(jq -r ".[$i].name" <<<$objs)
-          $CURL -X 'DELETE' $BASE_URL"/service/rest/v1/components/$id"   -H 'accept: application/json' > /dev/null
-          nb_file=$(( nb_file + 1 ))
-          progressbar "Remove contents for  $repository $name" "$nb_file" "$TOTAL_ITEMS"
-        done
+        id=$(jq -r ".[$i].id" <<<$objs)
+        name=$(jq -r ".[$i].name" <<<$objs)
+        $CURL -X 'DELETE' $BASE_URL"/service/rest/v1/components/$id"   -H 'accept: application/json' > /dev/null
+        progressbar "Remove contents for  $repository $name" "1" "$TOTAL_ITEMS"
       done
 
       _string="Remove content for $repository"
@@ -928,7 +945,7 @@ case "$CMD" in
     ;;
   "METADATA")
     ping
-    getAllpage $ARGS_LIST 0 1
+    getAllpage $SOURCE 0 1
     ;;
   *) 
     exit 1

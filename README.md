@@ -106,34 +106,62 @@ Credential setup :
 -------------------------------
 Usage
 -------------------------------
-# Get tool's version
-$ nx3all version
+  # Get tool's version
+  $ nx3all.bash version
 
-# List all repositories
-$ nx3all list -u nexus_url
-  $ nx3all list -u https://nexus.domain/nexus
+  # List all repositories
+  $ nx3all.bash list -u nexus_url
+    $ nx3all.bash list -u https://nexus.domain/nexus
 
-# Backup configuration
-$ nx3all backupcfg -u nexus_url
-  $ nx3all backupcfg -u https://nexus.domain/nexus 
+  # Backup configuration
+  $ nx3all.bash backupcfg -u nexus_url
+    $ nx3all.bash backupcfg -u https://nexus.domain/nexus
 
-# Restore configuration
-$ nx3all restorecfg -u nexus_url
-  $ nx3all restorecfg -u https://nexus.domain/nexus 
+  # Restore Configuration
+  $ nx3all.bash restorecfg -u nexus_url
+    $ nx3all.bash restorecfg -u https://nexus.domain/nexus
 
-# Backup, dump all artifacts in all repositories
-$ nx3all backup -u nexus_url --all
-  $ nx3all backup -u https://nexus.domain/nexus --all
+  # Backup, dump all artifacts in all repositories
+  $ nx3all.bash backup -u nexus_url --all
+    $ nx3all.bash backup -u https://nexus.domain/nexus --all
 
-# Backup, dump all artifacts in specifics repositories
-# limitation : repositories of type 'group' are not backup, just 'proxy' or 'hosted' are allowed
-$ nx3all backup -u nexus_url -s repo1
-$ nx3all backup -u nexus_url -s repo1,repo2,repo3
-  $ nx3all backup -u https://nexus.domain/nexus -s maven,raw-files,npm-proxy
+  # Backup, dump all artifacts in specifics repositories
+  # limitation : repositories of type 'group' are not backup, just 'proxy' or 'hosted' are allowed
+  $ nx3all.bash backup -u nexus_url -s repo1
+  $ nx3all.bash backup -u nexus_url -s repo1,repo2,repo3
+    $ nx3all.bash backup -u https://nexus.domain/nexus -s maven,raw-files,npm-proxy
 
-# Restore artifacts
-$ nx3all restore -u nexus_url -s source_dir -d nexus-repo-name
-   $ nx3all restore -u https://nexus.domain/nexus -s ./dl/maven -d maven-central
+  # Backup only files that match a filter
+    $ nx3all.bash backup -u https://nexus.domain/nexus -s raw-files  --filter "/version/"
+
+  # Restore artifacts
+  $ nx3all.bash restore -u nexus_url -s source_dir -d nexus-repo-name
+      $ nx3all.bash restore -u https://nexus.domain/nexus -s ./dl/maven -d maven-central
+
+  # Get metadata only for one repository
+  $ nx3all.bash metadata -u nexus_url -s nexus-repo-name
+      $ nx3all.bash metadata -u https://nexus.domain/nexus -s maven-central
+
+  # Create default usefull tasks
+  $ nx3all.bash task -u nexus_url -c
+      $ nx3all.bash task -u https://nexus.domain/nexus -c
+
+  # List all tasks
+  $ nx3all.bash task -u nexus_url -l
+      $ nx3all.bash task -u https://nexus.domain/nexus -l
+
+  # Invalidate all repositories cache
+  $ nx3all.bash invalidatecache -u nexus_url -a
+      $ nx3all.bash task -u https://nexus.domain/nexus -l
+
+  # Invalidate cache for some repositories
+  $ nx3all.bash invalidatecache -u nexus_url -s maven,raw-files,npm-proxy
+      $ nx3all.bash task -u https://nexus.domain/nexus -l
+
+  Note:
+    Behind a proxy, you must set environment variables :
+    on linux:   http_proxy/https_proxy
+    on windows: HTTP_PROXY/HTTPS_PROXY
 
 ```
 ### To Work behind a proxy
