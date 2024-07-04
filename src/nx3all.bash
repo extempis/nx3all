@@ -391,7 +391,7 @@ integrity() {
 }
 
 wget_item () {
-  LOG=$(mkdir -p `dirname $path` 2>&1)
+  LOG=$(mkdir -p $DIR_PREFIX/`dirname $path` 2>&1)
   RS=$?
   integrity_resu=0
 
@@ -399,10 +399,10 @@ wget_item () {
   [ $NB_REPOS -eq 1 ]  && progressbar "dl $repository $name" "$iter" "$TOTAL_ITEMS"
   [ $NB_REPOS -gt 1 ] && progressbar "dl $repository $name" "$CNT_REPO" "$NB_REPOS" "$iter" "$TOTAL_ITEMS"
 
-  if [ -f "$(dirname $path)/$name" ]; then
+  if [ -f "$DIR_PREFIX/$(dirname $path)/$name" ]; then
     integrity 
   else
-    LOG=$($CURL -o $(dirname "$path")/"$name" "$downloadUrl" 2>&1)
+    LOG=$($CURL -o $DIR_PREFIX/$(dirname "$path")/"$name" "$downloadUrl" 2>&1)
     RS=$?
     [ $RS -ne 0 ] && echo "Error: wget failed for $name in repository $repository : $downloadUrl ($LOG)" >> $LOGERROR && NB_FILE_KO=$((NB_FILE_KO + 1)) && return
     integrity 
