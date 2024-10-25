@@ -32,6 +32,7 @@ CHECK_INTEGRITY=
 OPTION_LIST=false
 OPTION_CREATE=false
 OPTION_REMOVE_ALL=false
+OPTION_SKIP_METADATA=false
 FILTER=
 
 _spin="/-\|"
@@ -103,6 +104,9 @@ usage () {
     # Backup only files that match a filter
       $ $(basename $0) backup -u https://nexus.domain/nexus -s raw-files  --filter "/version/"
 
+    # To skip already download metadata use --skip-metadata option
+      $ $(basename $0) backup -u https://nexus.domain/nexus -s raw-files  --skip-metadata
+
     # Restore artifacts
     $ $(basename $0) restore -u nexus_url -s source_dir -d nexus-repo-name
         $ $(basename $0) restore -u https://nexus.domain/nexus -s ./dl/maven -d maven-central
@@ -110,6 +114,10 @@ usage () {
     # Get metadata only for one repository
     $ $(basename $0) metadata -u nexus_url -s nexus-repo-name
         $ $(basename $0) metadata -u https://nexus.domain/nexus -s maven-central
+
+    # Get metadata for all repositories
+    $ $(basename $0) metadata -u nexus_url --all
+        $ $(basename $0) metadata -u https://nexus.domain/nexus --all
 
     # Create default usefull tasks
     $ $(basename $0) task -u nexus_url -c
@@ -186,7 +194,7 @@ parse_args() {
   esac
   shift
   
-  VALID_ARGS=$(getopt -o crliau:s:d:p:hzf: --long metadata:,remove,list,create,integrity:,all,zip,url:,source:,destination:,filter:,prefix:,help -- "$@")
+  VALID_ARGS=$(getopt -o crliau:s:d:p:hzf: --long metadata:,skip-metadata,remove,list,create,integrity:,all,zip,url:,source:,destination:,filter:,prefix:,help -- "$@")
   if [[ $? -ne 0 ]]; then
       exit 1;
   fi
@@ -201,6 +209,10 @@ parse_args() {
           ;;
       -a | --all)
           ARGS_LIST="--all"
+          shift
+          ;;
+      --skip-metadata)
+          OPTION_SKIP_METADATA=true
           shift
           ;;
       -i | --integrity)
@@ -323,8 +335,8 @@ getAllpage() {
   (( ${#_string} > 40 )) && _string="${_string:0:37}..."
 
   METADIR=$DIR_PREFIX/.metadata
-  TEMP_FILE="$METADIR/temp.json"
-  rm -fr $METADIR
+  TEMP_FILE="$METADIR/$repository-temp.json"
+  rm -f $TEMP_FILE
   mkdir -p $METADIR
 
   resu=$($CURL -o "$TEMP_FILE" -X 'GET' $BASE_URL'/service/rest/v1/components?repository='$repository -H 'accept: application/json')
@@ -484,11 +496,14 @@ backup() {
         names=$(echo $resu | jq -r '.[] |  select(.type != "group") | "\(.name)"' | sort)
         NB=$(echo $names | wc -w)
         i=1
-        for r in $names
-        do
-          getAllpage $r $i $NB
-          i=$(( i + 1 ))
-        done
+        if [[ "$OPTION_SKIP_METADATA" == 'false' ]]
+        then
+          for r in $names
+          do
+            getAllpage $r $i $NB
+            i=$(( i + 1 ))
+          done
+        fi
         echo ""
         i=1
         for r in $names
@@ -501,8 +516,46 @@ backup() {
         echo ""
         echo "Backup repository : $item"
         check_if_repository_exists $item
-        getAllpage $item 0 1
+        if [[ "$OPTION_SKIP_METADATA" == 'false' ]]
+        then        
+          getAllpage $item 0 1
+        fi
         download $item 0 1
+        ;;
+    esac
+  done
+  echo "The backup location : $DIR_PREFIX"
+}
+
+getmetadata() {
+  # Verify inputs
+  [ -z "$ARGS_LIST" ] && usage && echo "${_RED}Error:${_RESET} Missing repositories list to get metadata" && exit 1
+
+  mkdir -p $DIR_PREFIX/.metadata
+  
+  LIST=$(list)
+  
+  for item in ${ARGS_LIST//,/ }
+  do
+    case "$item" in
+      --all)
+        echo "Metadata for all repositories"
+        resu=$($CURL -X 'GET' $BASE_URL'/service/rest/v1/repositories' -H 'accept: application/json')
+        names=$(echo $resu | jq -r '.[] |  select(.type != "group") | "\(.name)"' | sort)
+        NB=$(echo $names | wc -w)
+        i=1
+        for r in $names
+        do
+          getAllpage $r $i $NB
+          i=$(( i + 1 ))
+        done
+        echo ""
+        ;;
+      *)
+        echo ""
+        echo "Get Metadata for repository : $item"
+        check_if_repository_exists $item
+        getAllpage $item 0 1
         ;;
     esac
   done
@@ -945,7 +998,7 @@ case "$CMD" in
     ;;
   "METADATA")
     ping
-    getAllpage $SOURCE 0 1
+    getmetadata
     ;;
   *) 
     exit 1
