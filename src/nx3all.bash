@@ -146,6 +146,15 @@ HELP_USAGE
 # nx3all destroy -u https://nexus.domain/nexus
 # nx3all delete -u https://nexus.domain/nexus -s maven-
 
+# Vérifie si les commandes nécessaires sont présentes
+for cmd in curl jq; do
+    if ! command -v $cmd &> /dev/null; then
+        echo "Erreur : $cmd n'est pas installé. Installez-le avant de continuer."
+        exit 1
+    fi
+done
+
+
 parse_args() {
   # parsing verb
   case "$1" in
@@ -206,6 +215,11 @@ parse_args() {
       -u | --url)
           BASE_URL=$(echo ${2%/})
           shift 2
+          # Valide que l'URL commence par http ou https
+          if [[ ! "$BASE_URL" =~ ^https?:// ]]; then
+              echo "Erreur : BASE_URL doit commencer par http:// ou https://"
+              exit 1
+          fi
           ;;
       -a | --all)
           ARGS_LIST="--all"
@@ -729,6 +743,92 @@ restore_config(){
   done
 }
 
+restore_config2() {
+  set -euo pipefail  # Sécurise le script (stop sur erreur, variable non définie, erreurs dans pipelines)
+  
+  # --- Configuration des arguments CURL ---
+  curlArgsPost=('-X' "POST" '-H' "accept: application/json" '-H' "Content-Type: application/json")
+  curlArgsPut=('-X' "PUT" '-H' "accept: application/json" '-H' "Content-Type: application/json")
+  curlArgsGet=('-X' "GET" '-H' "Content-Type: application/json")
+
+  grplist=()
+
+  trap 'rm -f res.json 2>/dev/null' EXIT  # Nettoyage automatique du fichier temporaire
+
+  # --- Fonction utilitaire pour créer un blob store ---
+  create_blob() {
+    local blob="$1"
+    echo -e "\tVérification du blob store : $blob"
+
+    # Vérifie si le blob existe déjà
+    if $CURL "${curlArgsGet[@]}" -fs "${BASE_URL}/service/rest/v1/blobstores" \
+      | jq -e ".[] | select(.name==\"$blob\")" >/dev/null 2>&1; then
+      echo -e "\t\tBlob store '$blob' déjà existant, ignoré."
+      return
+    fi
+
+    echo -e "\tCréation du blob store : $blob"
+    local json="{\"path\": \"$blob\", \"name\": \"$blob\"}"
+    local HTTP_CODE
+    HTTP_CODE=$($CURL "${curlArgsPost[@]}" -w "%{http_code}" -o res.json \
+      "${BASE_URL}/service/rest/v1/blobstores/file" -d "$json")
+
+    if [[ $HTTP_CODE -ge 400 ]]; then
+      echo -e "\t\t$_RED$(jq -r '.[0].message // .message // .error // .errors[0].message' res.json)$_RESET"
+    fi
+  }
+
+  # --- Fonction utilitaire pour créer un repository ---
+  create_repo() {
+    local file="$1"
+    local name blob format typ HTTP_CODE
+
+    name=$(jq -r '.name' "$file")
+    blob=$(jq -r '.storage.blobStoreName' "$file")
+    format=$(jq -r '.format' "$file")
+    [[ "$format" == "maven2" ]] && format="maven"
+    typ=$(jq -r '.type' "$file")
+
+    echo -e "\tCréation du repository : $name (format=$format, type=$typ)"
+
+    create_blob "$blob"
+
+    HTTP_CODE=$($CURL "${curlArgsPost[@]}" -w "%{http_code}" -o res.json \
+      "${BASE_URL}/service/rest/v1/repositories/$format/$typ" -d "$(< "$file")")
+
+    if [[ $HTTP_CODE -ge 400 ]]; then
+      echo -e "\t\t$_RED$(cat res.json)$_RESET"
+    fi
+
+    # Mise à jour (PUT) après création
+    $CURL "${curlArgsPut[@]}" "${BASE_URL}/service/rest/v1/repositories/$format/$typ" \
+      -d "$(< "$file")" >/dev/null
+  }
+
+  # --- Parcours des fichiers JSON ---
+  echo "🧩 Début de la restauration des configurations..."
+
+  for file in "${DIR_PREFIX}"/config/*.json; do
+    [[ -f "$file" ]] || continue  # Ignore si aucun fichier trouvé
+
+    typ=$(jq -r '.type' "$file")
+    if [[ "$typ" == "group" ]]; then
+      grplist+=("$file")
+    else
+      create_repo "$file"
+    fi
+  done
+
+  # --- Création des repositories de groupe ---
+  echo "🧩 Création des repositories de type 'group'..."
+  for file in "${grplist[@]}"; do
+    create_repo "$file"
+  done
+
+  echo "✅ Restauration terminée avec succès."
+}
+
+
 destroy(){
   read -p "Are you sure to delete all repositories ? " -n 1 -r
   echo    # (optional) move to a new line
@@ -757,48 +857,94 @@ destroy(){
 
 delete_content() {
   [ -z "$ARGS_LIST" ] && usage && echo "${_RED}Error:${_RESET} Missing repositories list to delete contents" && exit 1
-  
-  mkdir -p $DIR_PREFIX/.metadata
-  for repository in ${ARGS_LIST//,/ }
-  do
-    check_if_repository_exists $repository
 
-    LIST=$(list)
+  mkdir -p "$DIR_PREFIX/.metadata"
 
-    TYPE=$(echo "$LIST" | grep "^$repository\ " | awk '{print $2}' )
-    [[ "$TYPE" != "hosted" && "$TYPE" != "proxy" ]] && echo "${_RED}Error:${_RESET} Impossible to delete contents from the repository ${_BLUE}$repository${_RESET} because it is not a ${_GREEN}'hosted or proxy'${_RESET} type but a ${_RED}'$TYPE'${_RESET} type" && continue
+  # Cache de la liste des dépôts pour éviter des appels multiples
+  local LIST=$(list)
+  local TOTAL_REPOS=0
+  local TOTAL_SUCCESS=0
+  local TOTAL_FAILED=0
+  local TOTAL_SKIPPED=0
 
-    read -p "Are you sure you want to delete the content of the repository : $repository ? " -n 1 -r
-    if [[ $REPLY =~ ^[Yy]$ ]]
-    then
-      TOTAL_ITEMS=0
-      getAllpage $repository 0 1
+  for repository in ${ARGS_LIST//,/ }; do
+    ((TOTAL_REPOS++))
+    check_if_repository_exists "$repository"
 
-      METADIR=$DIR_PREFIX/.metadata
-      repo_metaddata_file="$METADIR/$repository.json"
+    local TYPE=$(echo "$LIST" | awk -v r="$repository" '$1==r {print $2}')
+    if [[ "$TYPE" != "hosted" && "$TYPE" != "proxy" ]]; then
+      echo "${_RED}Error:${_RESET} Cannot delete content from ${_BLUE}$repository${_RESET} (type=${_RED}$TYPE${_RESET})"
+      ((TOTAL_SKIPPED++))
+      continue
+    fi
 
-      [ ! -f "$repo_metaddata_file" ] && printf "\r%-40s %s$ERASETOEOL\n" "Remove content for $repository" "[${_YELLOW}SKIP${_RESET}](${_BLUE}$TOTAL_ITEMS${_RESET})" && continue
+    # Confirmation (sauf si MODE_FORCE activé)
+    if [[ "$MODE_FORCE" != "true" ]]; then
+      read -p "Delete content of repository ${_BLUE}$repository${_RESET}? [y/N] " -n 1 -r
+      echo
+      [[ ! $REPLY =~ ^[Yy]$ ]] && ((TOTAL_SKIPPED++)) && continue
+    fi
 
-      TOTAL_ITEMS=$(cat $METADIR/$repository*.json | grep downloadUrl | wc -l)
-      [ $TOTAL_ITEMS -eq 0 ] && printf "\r%-40s %s$ERASETOEOL\n" "Remove content for $repository" "[${_YELLOW}SKIP${_RESET}](${_BLUE}$TOTAL_ITEMS${_RESET})" && continue
+    local METADIR="$DIR_PREFIX/.metadata"
+    local repo_metaddata_file="$METADIR/$repository.json"
+    local NB_OK=0
+    local NB_KO=0
 
-      objs=$(jq -c ".items[]" $repo_metaddata_file | jq -s .)
-      length=$(jq ".|length" <<<$objs)
-      length=$(( length -1 ))
-      for i in `seq 0 $length`
-      do
-        id=$(jq -r ".[$i].id" <<<$objs)
-        name=$(jq -r ".[$i].name" <<<$objs)
-        $CURL -X 'DELETE' $BASE_URL"/service/rest/v1/components/$id"   -H 'accept: application/json' > /dev/null
-        progressbar "Remove contents for  $repository $name" "1" "$TOTAL_ITEMS"
-      done
+    echo "→ Fetching components list for ${_BLUE}$repository${_RESET}..."
+    getAllpage "$repository" 0 1
 
-      _string="Remove content for $repository"
-      (( ${#_string} > 40 )) && _string="${_string:0:37}..."
-      printf "\r%-40s %s$ERASETOEOL\n" "$_string" "[${_GREEN}COMPLETE${_RESET}]"
+    if [ ! -f "$repo_metaddata_file" ]; then
+      echo "⚠️  No metadata found for $repository — skipping."
+      ((TOTAL_SKIPPED++))
+      continue
+    fi
+
+    local objs=$(jq -c ".items[]" "$repo_metaddata_file" | jq -s .)
+    local TOTAL_ITEMS=$(jq "length" <<<"$objs")
+
+    if [ "$TOTAL_ITEMS" -eq 0 ]; then
+      echo "⚠️  No items to delete for $repository"
+      ((TOTAL_SKIPPED++))
+      continue
+    fi
+
+    echo "→ Deleting $TOTAL_ITEMS components from ${_BLUE}$repository${_RESET}..."
+
+    for ((i=0; i<TOTAL_ITEMS; i++)); do
+      id=$(jq -r ".[$i].id" <<<"$objs")
+      name=$(jq -r ".[$i].name" <<<"$objs")
+
+      http_code=$($CURL -s -o /dev/null -w "%{http_code}" -X DELETE \
+        "$BASE_URL/service/rest/v1/components/$id" -H 'accept: application/json')
+
+      if [[ "$http_code" == "204" ]]; then
+        ((NB_OK++))
+      else
+        ((NB_KO++))
+        echo "❌  Failed to delete $name (HTTP $http_code)"
+      fi
+      progressbar "Deleting $repository" "$((NB_OK + NB_KO))" "$TOTAL_ITEMS"
+    done
+
+    if (( NB_KO == 0 )); then
+      printf "\r%-40s %s$ERASETOEOL\n" "Remove content for $repository" "[${_GREEN}COMPLETE${_RESET}] ($NB_OK items)"
+      ((TOTAL_SUCCESS++))
+    else
+      printf "\r%-40s %s$ERASETOEOL\n" "Remove content for $repository" "[${_YELLOW}PARTIAL${_RESET}] ($NB_OK/${TOTAL_ITEMS})"
+      ((TOTAL_FAILED++))
     fi
   done
+
+  # Rapport final
+  echo
+  echo "===== 🧾 DELETE SUMMARY ====="
+  echo "Repositories processed : $TOTAL_REPOS"
+  echo "Successful deletions   : ${_GREEN}$TOTAL_SUCCESS${_RESET}"
+  echo "Partial/failed         : ${_YELLOW}$TOTAL_FAILED${_RESET}"
+  echo "Skipped                : ${_BLUE}$TOTAL_SKIPPED${_RESET}"
+  echo "============================="
 }
+
 
 invalidateCache() {
   LIST=$(list)
@@ -828,134 +974,293 @@ invalidateCache() {
   fi
 }
 
+invalidateCache2() {
+  set -euo pipefail  # Stoppe sur erreur, interdit variables non définies
+
+  # --- Vérification des prérequis ---
+  [[ -z "${BASE_URL:-}" ]] && { echo "❌ BASE_URL non défini."; return 1; }
+  [[ -z "${CURL:-}" ]] && { echo "❌ CURL non défini."; return 1; }
+
+  local dry_run=false
+  if [[ "${1:-}" == "--dry-run" ]]; then
+    dry_run=true
+    shift
+  fi
+
+  local ARGS_LIST="${1:-}"
+  local LIST
+  LIST=$(list || true)
+
+  if [[ -z "$LIST" ]]; then
+    echo "⚠️  Aucun repository trouvé via la commande 'list'."
+    return 0
+  fi
+
+  # --- Fonction interne pour invalider un repo ---
+  invalidate_one_repo() {
+    local repo="$1"
+    if [[ "$dry_run" == true ]]; then
+      echo -e "🧪 (Dry-run) Invalidate cache for ${_BLUE}$repo${_RESET}"
+      return
+    fi
+
+    local HTTP_CODE
+    HTTP_CODE=$($CURL -s -w "%{http_code}" -o /dev/null \
+      -X 'POST' "${BASE_URL}/service/rest/v1/repositories/${repo}/invalidate-cache" \
+      -H 'accept: application/json' || echo "000")
+
+    if [[ $HTTP_CODE == "204" ]]; then
+      echo -e "✅ Cache invalidé pour ${_GREEN}$repo${_RESET}"
+    elif [[ $HTTP_CODE == "000" ]]; then
+      echo -e "🚫 ${_RED}Erreur réseau${_RESET} : impossible de contacter Nexus pour ${_BLUE}$repo${_RESET}"
+    else
+      echo -e "❌ Échec pour ${_RED}$repo${_RESET} (code HTTP: $HTTP_CODE)"
+    fi
+  }
+
+  # --- Traitement principal ---
+  echo "🧩 Début de l’invalidation du cache..."
+  echo "🌐 Serveur : $BASE_URL"
+
+  local REPOS=()
+
+  # Mode --all : tous sauf hosted
+  if [[ "$ARGS_LIST" == "--all" ]]; then
+    mapfile -t REPOS < <(echo "$LIST" | awk '$2 != "hosted" {print $1}')
+    echo "🗂️  Mode --all : ${#REPOS[@]} repositories à traiter."
+  else
+    # Mode liste : noms séparés par virgules
+    IFS=',' read -ra INPUT <<< "$ARGS_LIST"
+    for repository in "${INPUT[@]}"; do
+      local TYPE
+      TYPE=$(echo "$LIST" | awk -v r="$repository" '$1==r {print $2}')
+      if [[ "$TYPE" == "hosted" ]]; then
+        echo -e "${_RED}Erreur:${_RESET} le dépôt ${_BLUE}$repository${_RESET} est de type ${_RED}hosted${_RESET}, cache non applicable."
+        continue
+      fi
+      REPOS+=("$repository")
+    done
+    echo "🗂️  Mode liste : ${#REPOS[@]} repositories à traiter."
+  fi
+
+  # --- Boucle sur les repositories ---
+  for repo in "${REPOS[@]}"; do
+    invalidate_one_repo "$repo"
+  done
+
+  echo "🏁 Invalidation terminée."
+}
+
 
 # see https://help.sonatype.com/en/tasks.html
 task() {
+  local CREATED_OK=0
+  local CREATED_KO=0
+  local SKIPPED_EXISTING=0
+  local REMOVED_OK=0
+  local REMOVED_KO=0
+  local TASKS_CACHE=""   # Contiendra la liste des tâches en cache
+  local CACHE_LOADED=false
+
+  # -----------------------------
+  # Fonctions utilitaires
+  # -----------------------------
+  load_tasks_cache() {
+    if [[ $CACHE_LOADED == true ]]; then
+      return 0
+    fi
+    echo "📦 Chargement du cache des tâches existantes..."
+    local res=$($CURL -s -X GET "${BASE_URL}/service/rest/v1/tasks" -H 'accept: application/json')
+    if [[ $? -ne 0 || -z $res ]]; then
+      echo "⚠️  [Avertissement] Impossible de charger les tâches existantes (connexion Nexus ?)"
+      return 1
+    fi
+    TASKS_CACHE=$(echo "$res" | jq -r '.items[].name' 2>/dev/null)
+    CACHE_LOADED=true
+  }
+
+  task_exists() {
+    local name="$1"
+    [[ -z $TASKS_CACHE ]] && load_tasks_cache
+    grep -qxF "$name" <<< "$TASKS_CACHE"
+  }
+
+  add_to_cache() {
+    local name="$1"
+    TASKS_CACHE+=$'\n'"$name"
+  }
+
+  post_task1() {
+    local json_data=$1
+    $CURL -s -X POST "${BASE_URL}/service/extdirect" \
+          -H 'Content-Type: application/json' \
+          --data-raw "$json_data" > /dev/null
+  }
+
+post_task() {
+    local json_data=$1
+    local task_name=$(echo $1 | jq -r .data[].name)
+    local response http_code
+
+    if task_exists "$task_name"; then
+      echo "⏭️  Tâche déjà existante : '$task_name' → ignorée."
+      ((SKIPPED_EXISTING++))
+      return 0
+    fi
+
+    response=$($CURL -s -w "%{http_code}" -o /tmp/post_task_response.json \
+      -X POST "${BASE_URL}/service/extdirect" \
+      -H 'Content-Type: application/json' \
+      --data-raw "$json_data")
+
+    http_code=${response: -3}
+
+    if [[ $http_code -ne 200 ]]; then
+      echo "❌ [ERREUR] Création échouée pour '$task_name' (HTTP $http_code)"
+      ((CREATED_KO++))
+      return 1
+    fi
+
+    if ! jq -e '.type == "rpc"' /tmp/post_task_response.json >/dev/null 2>&1; then
+      echo "⚠️  [Nexus] Réponse inattendue pour '$task_name'"
+      ((CREATED_KO++))
+      return 1
+    fi
+
+    echo "✅ Tâche créée : $task_name"
+    ((CREATED_OK++))
+    add_to_cache "$task_name"  # ajout au cache pour éviter re-création
+  }
+
+  list_tasks() {
+    local total=0
+    while :; do
+      local resu=$($CURL -s -X GET "${BASE_URL}/service/rest/v1/tasks" -H 'accept: application/json')
+      if [[ $? -ne 0 || -z $resu ]]; then
+        echo "❌ [ERREUR] Impossible de lister les tâches."
+        return 1
+      fi
+      echo "$resu" | jq -r '.items[] | "\(.id)\t\(.name)\t\(.type)"'
+      total=$((total + $(echo "$resu" | jq '.items | length')))
+      [ "$(echo "$resu" | jq -r .continuationToken)" == "null" ] && break
+    done
+    echo "→ Total des tâches listées : $total"
+  }
+
+  remove_all_tasks() {
+    echo "→ Suppression de toutes les tâches Nexus..."
+    while :; do
+      local resu=$($CURL -s -X GET "${BASE_URL}/service/rest/v1/tasks" -H 'accept: application/json')
+      if [[ $? -ne 0 || -z $resu ]]; then
+        echo "❌ [ERREUR] Impossible de récupérer la liste des tâches."
+        break
+      fi
+      echo "$resu" | jq -r '.items[].id' | while read id; do
+        if [[ -z $id ]]; then continue; fi
+        local json="{\"action\":\"coreui_Task\",\"method\":\"remove\",\"data\":[\"$id\"],\"type\":\"rpc\",\"tid\":$(date +%s%3N)}"
+        local resp_code
+        resp_code=$($CURL -s -o /dev/null -w "%{http_code}" -X POST "${BASE_URL}/service/extdirect" \
+          -H 'Content-Type: application/json' --data-raw "$json")
+        if [[ $resp_code -eq 200 ]]; then
+          ((REMOVED_OK++))
+        else
+          ((REMOVED_KO++))
+          echo "⚠️  Suppression échouée pour la tâche $id (HTTP $resp_code)"
+        fi
+      done
+      [ "$(echo "$resu" | jq -r .continuationToken)" == "null" ] && break
+    done
+    printf "🗑️  Tâches supprimées avec succès : %d\n" "$REMOVED_OK"
+    printf "⚠️  Tâches non supprimées (échec) : %d\n" "$REMOVED_KO"
+  }
+
+  # -----------------------------
+  # Préparation des données
+  # -----------------------------
   LIST=$(list)
-  YUM_REPOS_NAME=$(echo "$LIST" | grep yum | awk '{print $1}')
-  MAVEN_REPOS_NAME=$(echo "$LIST" | grep maven2 | awk '{print $1}')
-  BLOB=$($CURL -X 'GET' \
-    ${BASE_URL}'/service/rest/v1/blobstores' \
-    -H 'accept: application/json')
+  YUM_REPOS_NAME=$(echo "$LIST" | awk '$2=="hosted" && $3=="yum"' | awk '{print $1}' )
+  MAVEN_REPOS_NAME=$(echo "$LIST" | awk '$2=="hosted" && $3=="maven2"' | awk '{print $1}')
+  BLOB=$($CURL -s -X GET "${BASE_URL}/service/rest/v1/blobstores" -H 'accept: application/json')
 
-  # Create Admin - Compact blob store
-  blob_compact='{"action":"coreui_Task","method":"create","data":[{"id":"","typeId":"blobstore.compact","enabled":true,"name":"compact-blob-raw-hosted2","alertEmail":"","notificationCondition":"FAILURE","schedule":"weekly","properties":{"blobstoreName":"raw-hosted"},"recurringDays":[7],"startDate":"2023-01-01T21:00:00.000Z","timeZoneOffset":"+01:00"}],"type":"rpc","tid":113}'
-  # Create Admin - Delete blob store temporary files
-  blob_delete_tmp='{"action":"coreui_Task","method":"create","data":[{"id":"","typeId":"blobstore.delete-temp-files","enabled":true,"name":"deleteme","alertEmail":"","notificationCondition":"FAILURE","schedule":"daily","properties":{"blobstoreName":"bob-containers"},"recurringDays":[],"startDate":"2024-02-14T03:00:00.000Z","timeZoneOffset":"+01:00"}],"type":"rpc","tid":21}'
-  # Create Admin - Export databases for backup
-  # For those using OrientDB, this task performs a full backup of the underlying config, security, and component databases - not blobstore content.
-  # Be aware that while the task is running, the repository will temporarily be put into a read-only state.
-  admin_backup_db='{"action":"coreui_Task","method":"create","data":[{"id":"","typeId":"db.backup","enabled":true,"name":"admin-export-database-for-backup","alertEmail":"","notificationCondition":"FAILURE","schedule":"daily","properties":{"location":"/nexus-data/backup"},"recurringDays":[],"startDate":"2023-01-01T22:00:00.000Z","timeZoneOffset":"+01:00"}],"type":"rpc","tid":134}'
-  # Create Docker - Delete incomplete uploads
-  # This task cleans up orphaned files that may exist in temporary storage as result of a restart or incomplete/interrupted uploads.
-  docker='{"action":"coreui_Task","method":"create","data":[{"id":"","typeId":"repository.docker.upload-purge","enabled":true,"name":"docker-delete-incomplete-uploads","alertEmail":"","notificationCondition":"FAILURE","schedule":"weekly","properties":{"age":"72"},"recurringDays":[7],"startDate":"2023-01-18T08:15:00.000Z","timeZoneOffset":"+01:00"}],"type":"rpc","tid":137}'
-  # Create PyPI - Delete legacy proxy assets
-  # This task deletes old assets that were previously duplicated due to a code-path change.
-  pypi_delete_legacy_proxy_assets='{"action":"coreui_Task","method":"create","data":[{"id":"","typeId":"repository.pypi.delete-legacy-proxy-assets","enabled":true,"name":"pypi-delete-legacy-proxy-assets","alertEmail":"","notificationCondition":"FAILURE","schedule":"weekly","properties":{},"recurringDays":[1],"startDate":"2024-02-14T09:00:00.000Z","timeZoneOffset":"+01:00"}],"type":"rpc","tid":174}'
-  # Create Repair - Rebuild Maven repository metadata (maven-metadata.xml) Task
-  # This task rebuilds the maven-metadata.xml files with the correct information and will also (optionally) validate and fix any incorrect checksums (.md5/.sha1) for all files in the specified maven2 hosted repository.
-  maven='{"action":"coreui_Task","method":"create","data":[{"id":"","typeId":"repository.maven.rebuild-metadata","enabled":true,"name":"repair-rebuild-metadata-maven","alertEmail":"","notificationCondition":"FAILURE","schedule":"daily","properties":{"repositoryName":"dr-maven-releases","groupId":"","artifactId":"","baseVersion":"","rebuildChecksums":"true"},"recurringDays":[],"startDate":"2024-02-13T20:00:00.000Z","timeZoneOffset":"+01:00"}],"type":"rpc","tid":12}'
-  # Create Repair - Rebuild npm metadata Task
-  # This task rebuilds the metadata for a chosen npm hosted repository and can serve as a recovery tool in cases where the npm metadata has been corrupted. The task can rebuild metadata for all packages in the repository or only for a specified package.
-  npm='{"action":"coreui_Task","method":"create","data":[{"id":"","typeId":"repository.npm.rebuild-metadata","enabled":true,"name":"repair-all-npm-metadata","alertEmail":"","notificationCondition":"FAILURE","schedule":"daily","properties":{"repositoryName":"*","packageName":""},"recurringDays":[],"startDate":"2023-01-18T20:00:00.000Z","timeZoneOffset":"+01:00"}],"type":"rpc","tid":195}'
-  # Create Repair - Rebuild repository browse Task
-  # This task rebuilds the tree browsing data based upon current information in the database.
-  browse='{"action":"coreui_Task","method":"create","data":[{"id":"","typeId":"create.browse.nodes","enabled":true,"name":"repair-rebuild-all-repo-browse","alertEmail":"","notificationCondition":"FAILURE","schedule":"daily","properties":{"repositoryName":"*"},"recurringDays":[],"startDate":"2023-01-18T20:00:00.000Z","timeZoneOffset":"+01:00"}],"type":"rpc","tid":146}'
-  # Create Repair - Rebuild repository search Task
-  # With support for hosted and proxy repositories, this task rebuilds the search index. It inspects actual components and assets found in the selected repository and thus reflects the true content for supporting search and browse actions.
-  search='{"action":"coreui_Task","method":"create","data":[{"id":"","typeId":"repository.rebuild-index","enabled":true,"name":"repair-rebuild-all-repo-search","alertEmail":"","notificationCondition":"FAILURE","schedule":"daily","properties":{"repositoryName":"*"},"recurringDays":[],"startDate":"2023-01-18T20:00:00.000Z","timeZoneOffset":"+01:00"}],"type":"rpc","tid":152}'
-  # Create Repair - Rebuild Yum repository metadata (repodata) Task
-  # This task rebuilds the metadata for a chosen Yum hosted repository. 
-  # This task runs automatically 60 seconds (configurable) after an RPM is uploaded, deleted or redeployed.
-  yum='{"action":"coreui_Task","method":"create","data":[{"id":"","typeId":"repository.yum.rebuild.metadata","enabled":true,"name":"repair-rebuild-yum-metadata","alertEmail":"","notificationCondition":"FAILURE","schedule":"daily","properties":{"repositoryName":"dr-yum-hosted","yumMetadataCaching":"false"},"recurringDays":[],"startDate":"2023-01-18T20:00:00.000Z","timeZoneOffset":"+01:00"}],"type":"rpc","tid":158}'
-  # Create Repair - Reconcile component database from blob store
-  # This task allows you to recover lost asset/component metadata from a chosen blob store. 
-  # The task is useful in cases where you have restored from backup, and the database and blob storage may be out of sync.
-  # This task should never be executed during normal operation of the server. When executed, the task searches the selected blob store for blobs missing their associated metadata. The asset/component metadata is restored based on the information contained in the blob store.
-  reconcile_db_blob='{"action":"coreui_Task","method":"create","data":[{"id":"","typeId":"blobstore.rebuildComponentDB","enabled":true,"name":"attention-repair-reconcile-component-database-from-blob-store-","alertEmail":"","notificationCondition":"FAILURE","schedule":"manual","properties":{"blobstoreName":"bob1","dryRun":"false","sinceDays":null,"restoreBlobs":"true","undeleteBlobs":"true","integrityCheck":"true"},"recurringDays":[],"startDate":null,"timeZoneOffset":"+01:00"}],"type":"rpc","tid":192}'
-  # Create Repair - Repair - Reconcile date metadata from blob store
-  reconcile_date='{"action":"coreui_Task","method":"create","data":[{"id":"","typeId":"rebuild.asset.uploadMetadata","enabled":true,"name":"attention-repair-reconcile-date-metadata-from-blob-store","alertEmail":"","notificationCondition":"FAILURE","schedule":"manual","properties":{},"recurringDays":[],"startDate":null,"timeZoneOffset":"+01:00"}],"type":"rpc","tid":196}'
-  # Create Statistics - recalculate vulnerabilities statistics Task
-  # This task provides the Log4j Visualizer with request log data. When run, it deletes the existing data that the visualizer is using and re-processes the logs.
-  Statistics_recalculate_vulnerabilities='{"action":"coreui_Task","method":"create","data":[{"id":"","typeId":"repository.vulnerability.statistics","enabled":true,"name":"Statistics-recalculate-vulnerabilities","alertEmail":"","notificationCondition":"FAILURE","schedule":"daily","properties":{},"recurringDays":[],"startDate":"2024-02-14T06:00:00.000Z","timeZoneOffset":"+01:00"}],"type":"rpc","tid":202}'
-  # Docker - Delete unused manifests and images
-  # This task will handle deletion of content that is no longer referenced, images that are no longer referenced by a tagged manifest and V1 layers that are no longer referenced by a tagged layer.
-  docker_delete_unused_manifests_images='{"action":"coreui_Task","method":"create","data":[{"id":"","typeId":"repository.docker.gc","enabled":true,"name":"docker-delete-unused-manifests-images","alertEmail":"","notificationCondition":"FAILURE","schedule":"daily","properties":{"repositoryName":"*","deployOffset":"24"},"recurringDays":[],"startDate":"2024-02-14T05:00:00.000Z","timeZoneOffset":"+01:00"}],"type":"rpc","tid":33}'
+  # -----------------------------
+  # Création des tâches
+  # -----------------------------
+  if [[ $OPTION_CREATE == 'true' ]]; then
+    echo "→ Création des tâches globales et spécifiques..."
 
-  if [[ $OPTION_CREATE == 'true' ]]
-  then
-    # global task 
-    for i in "admin_backup_db" "docker" "npm" "browse" "search" "pypi_delete_legacy_proxy_assets" "reconcile_date" "Statistics_recalculate_vulnerabilities" "docker_delete_unused_manifests_images"
-    do
-      $CURL -X 'POST'  ${BASE_URL}'/service/extdirect' \
-          -H 'Content-Type: application/json' \
-          --data-raw "${!i}" > /dev/null
+    # --- Tâches globales
+    declare -a GLOBAL_TASKS=(
+      # Create Admin - Export databases for backup
+      # For those using OrientDB, this task performs a full backup of the underlying config, security, and component databases - not blobstore content.
+      # Be aware that while the task is running, the repository will temporarily be put into a read-only state.
+      '{"action":"coreui_Task","method":"create","data":[{"id":"","typeId":"db.backup","enabled":true,"name":"admin-export-database-for-backup","alertEmail":"","notificationCondition":"FAILURE","schedule":"daily","properties":{"location":"/nexus-data/backup"},"recurringDays":[],"startDate":"2023-01-01T22:00:00.000Z","timeZoneOffset":"+01:00"}],"type":"rpc","tid":134}' 
+      # Create Docker - Delete incomplete uploads
+      # This task cleans up orphaned files that may exist in temporary storage as result of a restart or incomplete/interrupted uploads.
+      '{"action":"coreui_Task","method":"create","data":[{"id":"","typeId":"repository.docker.upload-purge","enabled":true,"name":"docker-delete-incomplete-uploads","alertEmail":"","notificationCondition":"FAILURE","schedule":"weekly","properties":{"age":"72"},"recurringDays":[7],"startDate":"2023-01-18T08:15:00.000Z","timeZoneOffset":"+01:00"}],"type":"rpc","tid":137}'
+      # Create Repair - Rebuild npm metadata Task
+      # This task rebuilds the metadata for a chosen npm hosted repository and can serve as a recovery tool in cases where the npm metadata has been corrupted. The task can rebuild metadata for all packages in the repository or only for a specified package.
+      '{"action":"coreui_Task","method":"create","data":[{"id":"","typeId":"repository.npm.rebuild-metadata","enabled":true,"name":"repair-all-npm-metadata","alertEmail":"","notificationCondition":"FAILURE","schedule":"daily","properties":{"repositoryName":"*","packageName":""},"recurringDays":[],"startDate":"2023-01-18T20:00:00.000Z","timeZoneOffset":"+01:00"}],"type":"rpc","tid":195}'
+      # Create Repair - Rebuild repository browse Task
+      # This task rebuilds the tree browsing data based upon current information in the database.
+      '{"action":"coreui_Task","method":"create","data":[{"id":"","typeId":"create.browse.nodes","enabled":true,"name":"repair-rebuild-all-repo-browse","alertEmail":"","notificationCondition":"FAILURE","schedule":"daily","properties":{"repositoryName":"*"},"recurringDays":[],"startDate":"2023-01-18T20:00:00.000Z","timeZoneOffset":"+01:00"}],"type":"rpc","tid":146}'
+      # Create Repair - Rebuild repository search Task
+      # With support for hosted and proxy repositories, this task rebuilds the search index. It inspects actual components and assets found in the selected repository and thus reflects the true content for supporting search and browse actions.
+      '{"action":"coreui_Task","method":"create","data":[{"id":"","typeId":"repository.rebuild-index","enabled":true,"name":"repair-rebuild-all-repo-search","alertEmail":"","notificationCondition":"FAILURE","schedule":"daily","properties":{"repositoryName":"*"},"recurringDays":[],"startDate":"2023-01-18T20:00:00.000Z","timeZoneOffset":"+01:00"}],"type":"rpc","tid":152}'
+      # Create PyPI - Delete legacy proxy assets
+      # This task deletes old assets that were previously duplicated due to a code-path change.
+      '{"action":"coreui_Task","method":"create","data":[{"id":"","typeId":"repository.pypi.delete-legacy-proxy-assets","enabled":true,"name":"pypi-delete-legacy-proxy-assets","alertEmail":"","notificationCondition":"FAILURE","schedule":"weekly","properties":{},"recurringDays":[1],"startDate":"2024-02-14T09:00:00.000Z","timeZoneOffset":"+01:00"}],"type":"rpc","tid":174}'
+      # Create Repair - Repair - Reconcile date metadata from blob store
+      '{"action":"coreui_Task","method":"create","data":[{"id":"","typeId":"rebuild.asset.uploadMetadata","enabled":true,"name":"attention-repair-reconcile-date-metadata-from-blob-store","alertEmail":"","notificationCondition":"FAILURE","schedule":"manual","properties":{},"recurringDays":[],"startDate":null,"timeZoneOffset":"+01:00"}],"type":"rpc","tid":196}'
+      # Create Statistics - recalculate vulnerabilities statistics Task
+      # This task provides the Log4j Visualizer with request log data. When run, it deletes the existing data that the visualizer is using and re-processes the logs.
+      '{"action":"coreui_Task","method":"create","data":[{"id":"","typeId":"repository.vulnerability.statistics","enabled":true,"name":"Statistics-recalculate-vulnerabilities","alertEmail":"","notificationCondition":"FAILURE","schedule":"daily","properties":{},"recurringDays":[],"startDate":"2024-02-14T06:00:00.000Z","timeZoneOffset":"+01:00"}],"type":"rpc","tid":202}'
+      # Docker - Delete unused manifests and images
+      # This task will handle deletion of content that is no longer referenced, images that are no longer referenced by a tagged manifest and V1 layers that are no longer referenced by a tagged layer.
+      '{"action":"coreui_Task","method":"create","data":[{"id":"","typeId":"repository.docker.gc","enabled":true,"name":"docker-delete-unused-manifests-images","alertEmail":"","notificationCondition":"FAILURE","schedule":"daily","properties":{"repositoryName":"*","deployOffset":"24"},"recurringDays":[],"startDate":"2024-02-14T05:00:00.000Z","timeZoneOffset":"+01:00"}],"type":"rpc","tid":33}'
+    )
+
+    for task_json in "${GLOBAL_TASKS[@]}"; do
+      post_task "${task_json}"
     done
-    # blob stuff
-    echo $BLOB | jq -c '.[]' | while read i; do
-      blob_mane=$(echo $i | jq -r .name)
-      resu=$(echo $blob_compact | jq -c ".data[].name = \"compact-blob-$blob_mane\" | .data[].properties.blobstoreName = \"$blob_mane\"")
-      $CURL -X 'POST'  ${BASE_URL}'/service/extdirect' \
-          -H 'Content-Type: application/json' \
-          --data-raw "$resu" > /dev/null
-      resu=$(echo $blob_delete_tmp | jq -c ".data[].name = \"blob-delete-tmp-file-$blob_mane\" | .data[].properties.blobstoreName = \"$blob_mane\"")
-      $CURL -X 'POST'  ${BASE_URL}'/service/extdirect' \
-          -H 'Content-Type: application/json' \
-          --data-raw "$resu" > /dev/null
-      resu=$(echo $reconcile_db_blob | jq -c ".data[].name = \"attention-repair-reconcile-component-database-from-blob-store-$blob_mane\" | .data[].properties.blobstoreName = \"$blob_mane\"")
-      $CURL -X 'POST'  ${BASE_URL}'/service/extdirect' \
-          -H 'Content-Type: application/json' \
-          --data-raw "$resu" > /dev/null
+
+    # --- Boucle sur les blob stores
+    echo "→ Création des tâches pour chaque blob store..."
+    echo "$BLOB" | jq -r '.[].name' | while read -r blob_name; do
+      post_task "$(jq -n --arg b "$blob_name" \
+        '{"action":"coreui_Task","method":"create","data":[{"id":"","typeId":"blobstore.compact","enabled":true,"name":("compact-blob-"+$b),"alertEmail":"","notificationCondition":"FAILURE","schedule":"weekly","properties":{"blobstoreName":$b},"recurringDays":[7],"startDate":"2023-01-01T21:00:00.000Z","timeZoneOffset":"+01:00"}],"type":"rpc","tid":113}')"
+      post_task "$(jq -n --arg b "$blob_name" \
+        '{"action":"coreui_Task","method":"create","data":[{"id":"","typeId":"blobstore.delete-temp-files","enabled":true,"name":("blob-delete-tmp-file-"+$b),"alertEmail":"","notificationCondition":"FAILURE","schedule":"daily","properties":{"blobstoreName":$b},"recurringDays":[],"startDate":"2024-02-14T03:00:00.000Z","timeZoneOffset":"+01:00"}],"type":"rpc","tid":21}')"
+      post_task "$(jq -n --arg b "$blob_name" \
+        '{"action":"coreui_Task","method":"create","data":[{"id":"","typeId":"blobstore.rebuildComponentDB","enabled":true,"name":("repair-component-db-"+$b),"alertEmail":"","notificationCondition":"FAILURE","schedule":"manual","properties":{"blobstoreName":$b,"dryRun":"false","restoreBlobs":"true","undeleteBlobs":"true","integrityCheck":"true"},"recurringDays":[],"startDate":null,"timeZoneOffset":"+01:00"}],"type":"rpc","tid":192}')"
     done
-    # Yum repo tasks
-    for i in $YUM_REPOS_NAME
-    do
-      resu=$(echo $yum | jq -c ".data[].name = \"repair-rebuild-yum-metadata-$i\" | .data[].properties.repositoryName = \"$i\"")
-      $CURL -X 'POST'  ${BASE_URL}'/service/extdirect' \
-          -H 'Content-Type: application/json' \
-          --data-raw "$resu" > /dev/null
+
+    # --- Boucle sur les repos Yum
+    echo "→ Création des tâches pour les dépôts Yum..."
+    for repo in $YUM_REPOS_NAME; do
+      post_task "$(jq -n --arg r "$repo" \
+        '{"action":"coreui_Task","method":"create","data":[{"id":"","typeId":"repository.yum.rebuild.metadata","enabled":true,"name":("repair-rebuild-yum-metadata-"+$r),"alertEmail":"","notificationCondition":"FAILURE","schedule":"daily","properties":{"repositoryName":$r,"yumMetadataCaching":"false"},"recurringDays":[],"startDate":"2023-01-18T20:00:00.000Z","timeZoneOffset":"+01:00"}],"type":"rpc","tid":158}')"
     done
-    # maven repo tasks
-    for i in $MAVEN_REPOS_NAME
-    do
-      resu=$(echo $maven | jq -c ".data[].name = \"repair-rebuild-metadata-$i\" | .data[].properties.repositoryName = \"$i\"")
-      $CURL -X 'POST'  ${BASE_URL}'/service/extdirect' \
-          -H 'Content-Type: application/json' \
-          --data-raw "$resu" > /dev/null
-    done
-  fi
-  if [[ $OPTION_LIST == 'true' ]]
-  then
-    while :
-    do
-      resu=$($CURL -X 'GET' \
-            ${BASE_URL}'/service/rest/v1/tasks' \
-            -H 'accept: application/json')
-      continuationToken=$(echo $resu | jq -r .continuationToken)
-      echo $resu | jq -c '.items[]' | while read i; do
-        echo $i | jq -r '. | "\(.id)\t\t\(.name)\t\t\(.type) "'
-      done
-      [ "$continuationToken" == "null" ] && break
-    done
-  fi
-  if [[ $OPTION_REMOVE_ALL == 'true' ]]
-  then
-    while :
-    do
-      resu=$($CURL -X 'GET' \
-            ${BASE_URL}'/service/rest/v1/tasks' \
-            -H 'accept: application/json')
-      continuationToken=$(echo $resu | jq -r .continuationToken)
-      echo $resu | jq -c '.items[]' | while read i; do
-        id=$(echo $i | jq -r '.id')
-        $CURL -X 'POST'  ${BASE_URL}'/service/extdirect' \
-            -H 'Content-Type: application/json' \
-            --data-raw "{\"action\":\"coreui_Task\",\"method\":\"remove\",\"data\":[\"$id\"],\"type\":\"rpc\",\"tid\":402}" > /dev/null
-      done
-      [ "$continuationToken" == "null" ] && break
+
+    # --- Boucle sur les repos Maven
+    echo "→ Création des tâches pour les dépôts Maven..."
+    for repo in $MAVEN_REPOS_NAME; do
+      post_task "$(jq -n --arg r "$repo" \
+        '{"action":"coreui_Task","method":"create","data":[{"id":"","typeId":"repository.maven.rebuild-metadata","enabled":true,"name":("repair-rebuild-metadata-"+$r),"alertEmail":"","notificationCondition":"FAILURE","schedule":"daily","properties":{"repositoryName":$r,"groupId":"","artifactId":"","baseVersion":"","rebuildChecksums":"true"},"recurringDays":[],"startDate":"2024-02-13T20:00:00.000Z","timeZoneOffset":"+01:00"}],"type":"rpc","tid":12}')"
     done
   fi
+
+  # -----------------------------
+  # Listing des tâches
+  # -----------------------------
+  [[ $OPTION_LIST == 'true' ]] && list_tasks
+
+  # -----------------------------
+  # Suppression de toutes les tâches
+  # -----------------------------
+  [[ $OPTION_REMOVE_ALL == 'true' ]] && remove_all_tasks
+
 }
+
 
 parse_args "$@"
 case "$CMD" in
